@@ -1,0 +1,71 @@
+/* ─── Always-present tokens ───────────────────────────────────────── */
+:root {
+  --lnr-accent: #5e6ad2;
+  --lnr-accent-hover: #6872d8;
+  --lnr-success: #4caf50;
+  --lnr-warning: #f59e0b;
+  --lnr-error: #ef4444;
+  --lnr-transition: background 120ms ease, border-color 120ms ease, color 120ms ease, opacity 120ms ease;
+}
+
+/* ─── Dark mode ───────────────────────────────────────────────────── */
+[data-mantine-color-scheme="dark"] {
+  --lnr-bg: #0d0d10;
+  --lnr-sidebar: #111113;
+  --lnr-surface: #16161a;
+  --lnr-elevated: #1c1c20;
+  --lnr-border: #252528;
+  --lnr-border-strong: #2e2e33;
+  --lnr-accent-muted: rgba(94, 106, 210, 0.12);
+  --lnr-text: #e1e1e3;
+  --lnr-text-muted: #8f8f9e;
+  --lnr-text-faint: #5a5a6e;
+  --mantine-color-body: var(--lnr-bg);
+}
+
+/* ─── Light mode ──────────────────────────────────────────────────── */
+[data-mantine-color-scheme="light"] {
+  --lnr-bg: #f7f7f8;
+  --lnr-sidebar: #ffffff;
+  --lnr-surface: #ffffff;
+  --lnr-elevated: #ffffff;
+  --lnr-border: #e5e5e7;
+  --lnr-border-strong: #d1d1d6;
+  --lnr-accent-muted: rgba(94, 106, 210, 0.08);
+  --lnr-text: #0d0d10;
+  --lnr-text-muted: #5a5a6e;
+  --lnr-text-faint: #8f8f9e;
+  --mantine-color-body: var(--lnr-bg);
+}
+
+/* ─── Base ────────────────────────────────────────────────────────── */
+body {
+  background: var(--lnr-bg) !important;
+  color: var(--lnr-text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ─── Scrollbars ──────────────────────────────────────────────────── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--lnr-border-strong) transparent;
+}
+*::-webkit-scrollbar { width: 5px; height: 5px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: var(--lnr-border-strong); border-radius: 3px; }
+*::-webkit-scrollbar-thumb:hover { background: var(--lnr-text-faint); }
+
+::selection {
+  background: rgba(94, 106, 210, 0.25);
+  color: var(--lnr-text);
+}
+
+[data-mantine-color-scheme="dark"] .mantine-Overlay-root {
+  background: rgba(0, 0, 0, 0.65) !important;
+}
+[data-mantine-color-scheme="light"] .mantine-Overlay-root {
+  background: rgba(0, 0, 0, 0.4) !important;
+}
+
+table { border-collapse: collapse; }

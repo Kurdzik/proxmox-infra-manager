@@ -1,0 +1,4 @@
+upstream {{ service_name }}_upstream {
+    server {{ upstream_ip }}:{{ upstream_port }};
+    keepalive 32;
+}

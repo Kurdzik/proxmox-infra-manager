@@ -1,0 +1,17 @@
+FROM node:20.18.0-bullseye
+
+RUN apt-get update && apt-get clean && mkdir /app
+
+COPY . /app
+WORKDIR /app/frontend
+
+RUN npm install
+
+ARG NEXT_PUBLIC_BACKEND_URL
+ENV NEXT_PUBLIC_BACKEND_URL=${NEXT_PUBLIC_BACKEND_URL}
+
+RUN yarn build
+
+EXPOSE 3000
+
+CMD ["npm", "start"]
