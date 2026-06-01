@@ -268,6 +268,9 @@ class ProxmoxVE8Adapter(BaseProxmoxAdapter):
             json=config,
         )
 
+    def delete_sdn_subnet(self, vnet_id: str, subnet_id: str) -> None:
+        self._request("DELETE", f"/cluster/sdn/vnets/{vnet_id}/subnets/{subnet_id}")
+
     def apply_sdn(self) -> dict | str:
         return self._request("PUT", "/cluster/sdn")
 

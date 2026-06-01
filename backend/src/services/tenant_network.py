@@ -152,11 +152,17 @@ def ensure_tenant_vnet(
     changed |= _ensure_sdn_subnet(adapter, vnet)
 
     if changed:
-        task = adapter.apply_sdn()
+        try:
+            task = adapter.apply_sdn()
+        except ProxmoxAPIError as exc:
+            raise TenantNetworkError(f"SDN apply failed: {exc.detail}") from exc
         _wait_for_sdn_apply(adapter, task)
 
     if target_node and not _wait_for_node_vnet(adapter, target_node, vnet.zone, vnet.vnet_id):
-        task = adapter.apply_sdn()
+        try:
+            task = adapter.apply_sdn()
+        except ProxmoxAPIError as exc:
+            raise TenantNetworkError(f"SDN apply failed: {exc.detail}") from exc
         _wait_for_sdn_apply(adapter, task)
         if not _wait_for_node_vnet(adapter, target_node, vnet.zone, vnet.vnet_id):
             status_text = _node_sdn_vnet_status_text(adapter, target_node, vnet.zone, vnet.vnet_id)
@@ -196,11 +202,17 @@ def ensure_vnet_on_node(
     changed |= _ensure_sdn_subnet(adapter, vnet)
 
     if changed:
-        task = adapter.apply_sdn()
+        try:
+            task = adapter.apply_sdn()
+        except ProxmoxAPIError as exc:
+            raise TenantNetworkError(f"SDN apply failed: {exc.detail}") from exc
         _wait_for_sdn_apply(adapter, task)
 
     if not _wait_for_node_vnet(adapter, target_node, vnet.zone, vnet.vnet_id):
-        task = adapter.apply_sdn()
+        try:
+            task = adapter.apply_sdn()
+        except ProxmoxAPIError as exc:
+            raise TenantNetworkError(f"SDN apply failed: {exc.detail}") from exc
         _wait_for_sdn_apply(adapter, task)
         if not _wait_for_node_vnet(adapter, target_node, vnet.zone, vnet.vnet_id):
             status_text = _node_sdn_vnet_status_text(adapter, target_node, vnet.zone, vnet.vnet_id)
@@ -307,11 +319,16 @@ def create_named_vnet(
     adapter: BaseProxmoxAdapter,
     tenant_id: str,
     name: str,
+    *,
+    target_node: Optional[str] = None,
 ) -> TenantVNet:
     """Create an additional named VNet for a tenant with auto-allocated subnet.
 
     Unlike ensure_tenant_vnet(), this always creates a new VNet (is_default=False)
     and raises TenantNetworkError on any failure.
+
+    Pass target_node to ensure the VNet bridge is active on that node before
+    returning — required when provisioning a VM immediately after creation.
     """
     import secrets
 
@@ -342,12 +359,30 @@ def create_named_vnet(
     db_session.add(vnet)
     db_session.flush()
 
-    _ensure_sdn_zone(adapter, vnet.zone, target_node=None)
+    _ensure_sdn_zone(adapter, vnet.zone, target_node=target_node)
     _ensure_sdn_vnet(adapter, vnet)
     _ensure_sdn_subnet(adapter, vnet)
 
-    task = adapter.apply_sdn()
+    try:
+        task = adapter.apply_sdn()
+    except ProxmoxAPIError as exc:
+        raise TenantNetworkError(f"SDN apply failed: {exc.detail}") from exc
     _wait_for_sdn_apply(adapter, task)
+
+    if target_node and not _wait_for_node_vnet(adapter, target_node, vnet.zone, vnet.vnet_id):
+        # One extra apply in case propagation lagged
+        try:
+            task = adapter.apply_sdn()
+        except ProxmoxAPIError as exc:
+            raise TenantNetworkError(f"SDN apply failed: {exc.detail}") from exc
+        _wait_for_sdn_apply(adapter, task)
+        if not _wait_for_node_vnet(adapter, target_node, vnet.zone, vnet.vnet_id):
+            status_text = _node_sdn_vnet_status_text(adapter, target_node, vnet.zone, vnet.vnet_id)
+            status_suffix = f" ({status_text})" if status_text else ""
+            raise TenantNetworkError(
+                f"SDN VNet {vnet.vnet_id} is not active on {target_node}{status_suffix}. "
+                "Check Proxmox SDN apply logs and ensure dnsmasq is installed."
+            )
 
     try:
         db_session.commit()
@@ -508,6 +543,53 @@ def _create_sdn_subnet(adapter: BaseProxmoxAdapter, vnet: TenantVNet) -> None:
             raise TenantNetworkError(
                 f"Failed to create subnet {vnet.subnet} on VNet {vnet.vnet_id}: {exc.detail}"
             ) from exc
+        # Orphaned subnet object from a previous failed provision — clean it up and retry.
+        _cleanup_orphaned_subnet(adapter, vnet)
+        try:
+            adapter.create_sdn_subnet(
+                vnet_id=vnet.vnet_id,
+                subnet=vnet.subnet,
+                gateway=vnet.gateway,
+                dhcp_start=vnet.dhcp_start,
+                dhcp_end=vnet.dhcp_end,
+                snat=DEFAULT_TENANT_SDN_SNAT,
+            )
+        except ProxmoxAPIError as retry_exc:
+            raise TenantNetworkError(
+                f"Failed to create subnet {vnet.subnet} on VNet {vnet.vnet_id} after cleanup: "
+                f"{retry_exc.detail}"
+            ) from retry_exc
+
+
+def _cleanup_orphaned_subnet(adapter: BaseProxmoxAdapter, vnet: TenantVNet) -> None:
+    """Scan all VNets for an orphaned subnet with the same CIDR and delete it.
+
+    Proxmox uses a globally unique subnet object ID ({zone}-{addr}-{prefix}) within
+    a zone. If a previous provision attempt created the subnet on the wrong or a
+    now-deleted VNet, Proxmox returns HTTP 500 "already defined" when we try to
+    create it again. Find the stale copy and remove it so we can proceed.
+    """
+    try:
+        all_vnets = adapter.list_vnets()
+    except ProxmoxAPIError:
+        return  # Best-effort; if we can't list, the retry will surface a clear error.
+
+    for v in all_vnets:
+        other_vnet_id = v.get("vnet") or v.get("id")
+        if not other_vnet_id or other_vnet_id == vnet.vnet_id:
+            continue
+        try:
+            subnets = adapter.list_sdn_subnets(other_vnet_id)
+        except ProxmoxAPIError:
+            continue
+        for s in subnets:
+            if _subnet_cidr(s) == vnet.subnet:
+                subnet_id = s.get("id") or _derive_subnet_id(vnet.zone, vnet.subnet)
+                try:
+                    adapter.delete_sdn_subnet(other_vnet_id, subnet_id)
+                except ProxmoxAPIError:
+                    pass  # Deletion failure will surface as a clear retry error above.
+                return
 
 
 def _subnet_payload(vnet: TenantVNet) -> dict:
@@ -675,7 +757,10 @@ def _wait_for_sdn_apply(adapter: BaseProxmoxAdapter, task: dict | str) -> None:
     if len(parts) < 2 or not parts[1]:
         return
     node = parts[1]
-    adapter.wait_for_task(node, upid, poll_interval=2, timeout=180)
+    try:
+        adapter.wait_for_task(node, upid, poll_interval=2, timeout=180)
+    except (ProxmoxAPIError, TimeoutError) as exc:
+        raise TenantNetworkError(f"SDN apply task did not complete: {exc}") from exc
     log_lines = _task_log_text(adapter, node, upid)
     if "missing 'dnsmasq' package" in log_lines:
         raise TenantNetworkError(
@@ -697,8 +782,5 @@ def _task_log_text(adapter: BaseProxmoxAdapter, node: str, upid: str) -> str:
 
 def _already_exists(exc: ProxmoxAPIError) -> bool:
     detail = exc.detail.lower()
-    return exc.status_code in {400, 409} and (
-        "already exists" in detail
-        or "already defined" in detail
-        or "duplicate" in detail
-    )
+    keywords = ("already exists", "already defined", "duplicate")
+    return exc.status_code in {400, 409, 500} and any(kw in detail for kw in keywords)

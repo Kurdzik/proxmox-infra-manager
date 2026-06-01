@@ -31,7 +31,13 @@ from src.nginx_manager import NginxConfigManager
 from src.plugin_manager import DockerComposeRunner, IntegrationClient, PluginManifest
 from src.proxmox import ProxmoxAdapterFactory, ProxmoxCredentials
 from src.services.ssh_service import generate_ed25519_keypair
-from src.services.tenant_network import allocate_static_ip, ensure_tenant_vnet, ensure_vnet_on_node
+from src.services.tenant_network import (
+    TenantNetworkError,
+    allocate_static_ip,
+    create_named_vnet,
+    ensure_tenant_vnet,
+    ensure_vnet_on_node,
+)
 from src.terraform import TerraformManager
 
 app = Celery("infra-manager-worker")
@@ -206,7 +212,7 @@ def provision_vm(
     memory_mb: int,
     disk_gb: int,
     cloud_init_user: str,
-    bridge: str,
+    bridge: str | None = None,
     network_id: int | None = None,
     user_ssh_key_ids: list = [],
     auth_type: str = "ssh_key",
@@ -297,36 +303,68 @@ def provision_vm(
         # the long-running subprocess calls. Keeps connection pool usage minimal.
         try:
             with Session(engine) as db:
-                # Look up the specific VNet by its Proxmox bridge name (vnet_id).
-                # With multi-VNet support a tenant can have several, so we match on
-                # vnet_id (the bridge) rather than tenant_id.
-                tenant_vnet = db.exec(
-                    select(TenantVNet).where(
-                        and_(TenantVNet.tenant_id == tenant_id, TenantVNet.vnet_id == bridge)
-                    )
-                ).first()
-                if tenant_vnet:
-                    adapter = _get_adapter(db)
-                    if tenant_vnet.is_default:
-                        # Full setup for the default VNet (allocates subnet/DHCP if needed).
-                        tenant_vnet = ensure_tenant_vnet(
-                            db,
-                            adapter,
-                            tenant_id,
-                            target_node=node_name,
-                            commit=True,
-                        )
-                    else:
-                        # Non-default VNet was fully configured at creation time;
-                        # just make sure its bridge is active on this specific node.
-                        ensure_vnet_on_node(db, adapter, tenant_vnet, node_name)
+                adapter = _get_adapter(db)
+
+                if not bridge:
+                    # No network selected — auto-create an isolated per-VM VNet.
+                    logger.info("vm_per_vnet_creating", vm_id=vm_id, vm_name=vm_name, persist_db=True)
+                    tenant_vnet = create_named_vnet(db, adapter, tenant_id, vm_name, target_node=node_name)
+                    # create_named_vnet commits internally, so use the returned object.
                     bridge = tenant_vnet.vnet_id
+                    network_id = tenant_vnet.id
+                    # Assign the first DHCP address as a static IP — no conflicts
+                    # since this VM is the only resident of its own /24 VNet.
+                    if not static_ip and tenant_vnet.dhcp_start and tenant_vnet.gateway:
+                        import ipaddress as _ipaddress
+                        static_ip = tenant_vnet.dhcp_start
+                        static_gateway = tenant_vnet.gateway
+                        if tenant_vnet.subnet:
+                            static_prefix_len = _ipaddress.ip_network(
+                                tenant_vnet.subnet, strict=False
+                            ).prefixlen
+                    # Persist network assignment and pre-assigned IP on the VM record.
+                    vm_rec = db.exec(select(VM).where(VM.id == vm_id)).first()
+                    if vm_rec:
+                        vm_rec.network_id = network_id
+                        vm_rec.ip_address = static_ip
+                        db.add(vm_rec)
+                        db.commit()
                     logger.info(
                         "tenant_vnet_ready",
                         tenant_id=tenant_id,
                         vnet=tenant_vnet.vnet_id,
                         subnet=tenant_vnet.subnet,
                     )
+                else:
+                    # Look up the specific VNet by its Proxmox bridge name (vnet_id).
+                    # With multi-VNet support a tenant can have several, so we match on
+                    # vnet_id (the bridge) rather than tenant_id.
+                    tenant_vnet = db.exec(
+                        select(TenantVNet).where(
+                            and_(TenantVNet.tenant_id == tenant_id, TenantVNet.vnet_id == bridge)
+                        )
+                    ).first()
+                    if tenant_vnet:
+                        if tenant_vnet.is_default:
+                            # Full setup for the default VNet (allocates subnet/DHCP if needed).
+                            tenant_vnet = ensure_tenant_vnet(
+                                db,
+                                adapter,
+                                tenant_id,
+                                target_node=node_name,
+                                commit=True,
+                            )
+                        else:
+                            # Non-default VNet was fully configured at creation time;
+                            # just make sure its bridge is active on this specific node.
+                            ensure_vnet_on_node(db, adapter, tenant_vnet, node_name)
+                        bridge = tenant_vnet.vnet_id
+                        logger.info(
+                            "tenant_vnet_ready",
+                            tenant_id=tenant_id,
+                            vnet=tenant_vnet.vnet_id,
+                            subnet=tenant_vnet.subnet,
+                        )
 
             with Session(engine) as db:
                 config = db.exec(select(PlatformConfig)).first()

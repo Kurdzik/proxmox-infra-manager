@@ -14,11 +14,7 @@ from src.models import (
     VMSSHKey,
     VMTemplate,
 )
-from src.services.tenant_network import (
-    TenantNetworkError,
-    ensure_tenant_vnet,
-    get_platform_adapter,
-)
+from src.services.tenant_network import TenantNetworkError
 from src.utils import get_db_session, get_user_info
 
 logger = get_logger(__name__)
@@ -161,45 +157,27 @@ def provision_vm(
                 detail="Only cloud-image type images are supported for provisioning",
             )
 
-        # Resolve bridge: explicit override → specific VNet by ID → default tenant VNet.
+        # Resolve bridge: explicit override → specific VNet by ID → None (worker auto-creates per-VM VNet).
         bridge = request.bridge
         resolved_network_id: int | None = None
-        if not bridge:
-            try:
-                adapter = get_platform_adapter(db_session)
-                if request.network_id is not None:
-                    vnet = db_session.exec(
-                        select(TenantVNet).where(
-                            and_(
-                                TenantVNet.id == request.network_id,
-                                TenantVNet.tenant_id == user_info.tenant_id,
-                            )
-                        )
-                    ).first()
-                    if not vnet:
-                        raise HTTPException(
-                            status_code=status.HTTP_404_NOT_FOUND,
-                            detail=f"Network {request.network_id} not found",
-                        )
-                    bridge = vnet.vnet_id
-                    resolved_network_id = vnet.id
-                else:
-                    vnet = ensure_tenant_vnet(
-                        db_session,
-                        adapter,
-                        user_info.tenant_id,
-                        commit=True,
+        if not bridge and request.network_id is not None:
+            vnet = db_session.exec(
+                select(TenantVNet).where(
+                    and_(
+                        TenantVNet.id == request.network_id,
+                        TenantVNet.tenant_id == user_info.tenant_id,
                     )
-                    bridge = vnet.vnet_id
-                    resolved_network_id = vnet.id
-            except HTTPException:
-                raise
-            except TenantNetworkError as exc:
-                db_session.rollback()
-                status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-                if "not initialized" not in str(exc).lower():
-                    status_code = status.HTTP_502_BAD_GATEWAY
-                raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+                )
+            ).first()
+            if not vnet:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Network {request.network_id} not found",
+                )
+            bridge = vnet.vnet_id
+            resolved_network_id = vnet.id
+        # When bridge and resolved_network_id are both None the Celery worker
+        # will auto-create an isolated per-VM VNet during provisioning.
 
         vm = VM(
             tenant_id=user_info.tenant_id,

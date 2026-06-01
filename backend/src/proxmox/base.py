@@ -28,7 +28,15 @@ class BaseProxmoxAdapter:
         with httpx.Client(verify=self.credentials.verify_ssl, timeout=30) as client:
             response = client.request(method, url, headers=self._headers, **kwargs)
         if response.status_code >= 400:
-            raise ProxmoxAPIError(response.status_code, response.text)
+            body = response.text.strip()
+            # Proxmox sometimes returns {"data":null} with the real error in the HTTP
+            # reason phrase (e.g. "500 create sdn subnet object failed: already defined").
+            # Fall back to reason_phrase so callers see a useful message.
+            if body in ("", '{"data":null}', "null"):
+                detail = response.reason_phrase or body
+            else:
+                detail = body
+            raise ProxmoxAPIError(response.status_code, detail)
         return response.json().get("data", {})
 
     def _not_implemented(self):
@@ -201,6 +209,9 @@ class BaseProxmoxAdapter:
         self._not_implemented()
 
     def update_sdn_subnet(self, vnet_id: str, subnet_id: str, config: dict) -> dict:
+        self._not_implemented()
+
+    def delete_sdn_subnet(self, vnet_id: str, subnet_id: str) -> None:
         self._not_implemented()
 
     def apply_sdn(self) -> dict | str:

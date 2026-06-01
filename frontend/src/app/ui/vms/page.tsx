@@ -187,8 +187,8 @@ export default function VMsPage() {
     if (netsRes.status === "fulfilled" && netsRes.value.status === 200) {
       const nets: VNet[] = netsRes.value.data?.networks || [];
       setNetworks(nets);
-      const def = nets.find((n) => n.is_default);
-      if (def) setSelectedNetworkId(String(def.id));
+      // Default to auto-create (null) — each VM gets its own isolated VNet.
+      // User can override by picking an existing network from the dropdown.
     }
   };
 
@@ -504,15 +504,15 @@ export default function VMsPage() {
 
           <Select
             label="Network"
-            description="VNet the VM will join — each network has its own DHCP subnet"
-            placeholder="Select a network"
+            description="Leave empty to auto-create an isolated VNet for this VM, or pick an existing one to share."
+            placeholder="Auto-create new VNet (default)"
             data={networks.map((n) => ({
               value: String(n.id),
               label: n.is_default ? `${n.name} (default)${n.subnet ? ` — ${n.subnet}` : ""}` : `${n.name}${n.subnet ? ` — ${n.subnet}` : ""}`,
             }))}
             value={selectedNetworkId}
             onChange={setSelectedNetworkId}
-            clearable={false}
+            clearable
           />
 
           <Box>
@@ -574,6 +574,11 @@ export default function VMsPage() {
               </Text>
               <Text size="xs" c="dimmed">
                 {cpuCores} vCPU · {memoryMb} MB RAM · {diskGb} GB disk · user: {cloudInitUser}
+              </Text>
+              <Text size="xs" c="dimmed">
+                Network: {selectedNetworkId
+                  ? networks.find((n) => String(n.id) === selectedNetworkId)?.name ?? selectedNetworkId
+                  : "auto-create isolated VNet"}
               </Text>
               <Text size="xs" c="dimmed">
                 Auth: {authType === "ssh_key" ? "SSH keypair" : "username + password"}
