@@ -11,6 +11,7 @@ from src.api.images import router as images_router
 from src.api.firewall import router as firewall_router
 from src.api.dns import router as dns_router
 from src.api.services import router as services_router
+from src.api.keys import router as keys_router
 from src.middleware import check_token
 
 # Public router — check_token still runs so request.state is always populated,
@@ -23,12 +24,17 @@ public_router.include_router(users_router)
 api_router = APIRouter(prefix="/api/v1", dependencies=[Depends(check_token)])
 api_router.include_router(nodes_router)
 api_router.include_router(vms_router)
-api_router.include_router(terminal_router)
 api_router.include_router(docker_router)
 api_router.include_router(plugins_router)
 api_router.include_router(images_router)
 api_router.include_router(firewall_router)
 api_router.include_router(dns_router)
 api_router.include_router(services_router)
+api_router.include_router(keys_router)
 
-__all__ = ["api_router", "public_router"]
+# WebSocket router — NO check_token dependency: APIKeyHeader requires HTTP Request scope,
+# which WebSocket connections do not provide. The terminal endpoint does its own token auth.
+ws_router = APIRouter(prefix="/api/v1")
+ws_router.include_router(terminal_router)
+
+__all__ = ["api_router", "public_router", "ws_router"]

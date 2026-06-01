@@ -72,6 +72,7 @@ class ProvisionVMRequest(BaseModel):
     disk_gb: int = 20
     cloud_init_user: str = "ubuntu"
     bridge: Optional[str] = None  # defaults to tenant vnet bridge or vmbr0
+    user_ssh_key_ids: list[int] = []
 
 
 # ---------------------------------------------------------------------------

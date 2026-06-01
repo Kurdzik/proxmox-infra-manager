@@ -164,6 +164,7 @@ def provision_vm(
                 "disk_gb": request.disk_gb,
                 "cloud_init_user": request.cloud_init_user,
                 "bridge": bridge,
+                "user_ssh_key_ids": request.user_ssh_key_ids,
             },
             ignore_result=True,
         )

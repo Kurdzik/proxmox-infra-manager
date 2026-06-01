@@ -8,6 +8,7 @@ from src.models.db import (
     VM,
     TerraformWorkspace,
     VMSSHKey,
+    UserSSHKey,
     AllowedImage,
     Plugin,
     PluginCapabilityCache,
@@ -37,7 +38,7 @@ from src.models.api import (
 
 __all__ = [
     "User", "Session", "PlatformConfig", "ProxmoxNode", "TenantVNet",
-    "VMTemplate", "VM", "TerraformWorkspace", "VMSSHKey",
+    "VMTemplate", "VM", "TerraformWorkspace", "VMSSHKey", "UserSSHKey",
     "AllowedImage", "Plugin", "PluginCapabilityCache",
     "DockerService", "FirewallRule", "DNSEntry", "NginxConfig",
     "Logs", "TenantLogSettings",

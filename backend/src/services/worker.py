@@ -87,6 +87,8 @@ def _get_adapter(db_session: Session):
     return ProxmoxAdapterFactory.create(config.proxmox_version, credentials)
 
 
+
+
 # ---------------------------------------------------------------------------
 # Cluster sync
 # ---------------------------------------------------------------------------
@@ -145,7 +147,10 @@ def sync_cluster_state(self):
                     vmid = vm_data.get("vmid")
                     vm = db.exec(select(VM).where(VM.vmid == vmid)).first()
                     if vm:
-                        vm.status = vm_data.get("status", "stopped")
+                        # Don't overwrite managed transition states — the provision
+                        # task owns "provisioning" until SSH is verified.
+                        if vm.status != "provisioning":
+                            vm.status = vm_data.get("status", "stopped")
                         if vm_data.get("cpus"):
                             vm.cpu_cores = vm_data["cpus"]
                         if vm_data.get("maxmem"):
@@ -171,7 +176,7 @@ def sync_cluster_state(self):
 # VM provisioning (Terraform-based)
 # ---------------------------------------------------------------------------
 
-@app.task(bind=True, max_retries=TASK_MAX_RETRIES, soft_time_limit=1800, time_limit=1860)
+@app.task(bind=True, max_retries=TASK_MAX_RETRIES, soft_time_limit=3540, time_limit=3600)
 def provision_vm(
     self,
     vm_id: int,
@@ -184,26 +189,37 @@ def provision_vm(
     disk_gb: int,
     cloud_init_user: str,
     bridge: str,
+    user_ssh_key_ids: list = [],
 ):
+    from celery.exceptions import Retry
+    from src.images import IMAGE_BY_ID
+
     with tenant_context(tenant_id=tenant_id, service_name="worker.provision_vm"):
-        with Session(engine) as db:
-            with _tenant_provision_slot(tenant_id) as acquired:
-                if not acquired:
-                    raise self.retry(countdown=30)
+        work_dir = f"/tmp/tf_{vm_id}"
+        vmid: Optional[int] = None
+        provisioned_vmid: Optional[int] = None
+        initial_ip: Optional[str] = None
 
-                vm = db.exec(select(VM).where(and_(VM.tenant_id == tenant_id, VM.id == vm_id))).first()
-                if not vm:
-                    raise ValueError(f"VM record {vm_id} not found")
+        # ── Phase 0: Reserve VMID — advisory lock held for milliseconds only ─────────
+        #
+        # The lock serialises concurrent VMID allocations for the same tenant so two
+        # simultaneous provisions don't pick the same vmid. It must be released BEFORE
+        # terraform runs — terraform init + apply can take 5-20 minutes and holding
+        # the lock that long causes MaxRetriesExceededError for any second provision.
+        try:
+            with Session(engine) as db:
+                with _tenant_provision_slot(tenant_id) as acquired:
+                    if not acquired:
+                        raise self.retry(countdown=30)
 
-                work_dir = f"/tmp/tf_{vm_id}"
-                try:
-                    # 1. Validate image
-                    from src.images import IMAGE_BY_ID
+                    vm = db.exec(select(VM).where(and_(VM.tenant_id == tenant_id, VM.id == vm_id))).first()
+                    if not vm:
+                        raise ValueError(f"VM record {vm_id} not found")
+
                     img = IMAGE_BY_ID.get(image_id)
                     if not img or img.get("image_type") != "cloud-image":
                         raise ValueError(f"Image '{image_id}' not found or is not a cloud-image type")
 
-                    # 2. Allocate VMID — union of Proxmox + DB to avoid reuse of errored VMs
                     adapter = _get_adapter(db)
                     proxmox_vmids = {v.get("vmid") for v in adapter.list_vms(node_name)}
                     db_vmids = {v.vmid for v in db.exec(select(VM).where(VM.vmid > 0)).all()}
@@ -212,92 +228,168 @@ def provision_vm(
                     vm.vmid = vmid
                     db.add(vm)
                     db.commit()
-
-                    # 3. Generate SSH keypair
-                    public_key, private_key_pem = generate_ed25519_keypair()
-
-                    # 4. Load platform config for Terraform provider
-                    config = db.exec(select(PlatformConfig)).first()
-                    token_secret = decrypt_str(config.encrypted_token_secret)
-                    api_token = f"{config.token_id}={token_secret}"
-                    if not config.ssh_username or not config.encrypted_ssh_password:
-                        raise ValueError(
-                            "SSH credentials not configured. Go to Settings → SSH Credentials and save Proxmox SSH username/password."
-                        )
-                    ssh_password = decrypt_str(config.encrypted_ssh_password)
-
-                    # 5. Render Terraform template
-                    os.makedirs(work_dir, exist_ok=True)
-                    tf_mgr = TerraformManager(work_dir)
-                    rendered = tf_mgr.render_template("proxmox_vm.tf.j2", {
-                        "proxmox_url": config.proxmox_url,
-                        "api_token": api_token,
-                        "insecure": not config.verify_ssl,
-                        "ssh_username": config.ssh_username,
-                        "ssh_password": ssh_password,
-                        "node_name": node_name,
-                        "vm_name": vm_name,
-                        "vmid": vmid,
-                        "cpu_cores": cpu_cores,
-                        "memory_mb": memory_mb,
-                        "disk_gb": disk_gb,
-                        "image_filename": img["filename"],
-                        "bridge": bridge,
-                        "cloud_init_user": cloud_init_user,
-                        "ssh_public_keys": [public_key],
-                    })
-                    tf_mgr.write_config(rendered)
-
-                    # 6. terraform init + apply
-                    logger.info("terraform_init_started", vmid=vmid, persist_db=True)
-                    tf_mgr.init()
-                    logger.info("terraform_apply_started", vmid=vmid, persist_db=True)
-                    outputs = tf_mgr.apply()
-
-                    # 7. Persist terraform state
-                    state_json = tf_mgr.read_state()
-                    workspace = TerraformWorkspace(
-                        vm_id=vm_id,
-                        tenant_id=tenant_id,
-                        rendered_config=rendered,
-                        terraform_state=state_json,
-                    )
-                    db.add(workspace)
-
-                    # 8. Persist SSH key (private key encrypted at rest)
-                    ssh_key_record = VMSSHKey(
-                        vm_id=vm_id,
-                        tenant_id=tenant_id,
-                        public_key=public_key,
-                        private_key_encrypted=encrypt_str(private_key_pem),
-                        key_type="ed25519",
-                    )
-                    db.add(ssh_key_record)
-
-                    # 9. Update VM record
-                    ip = outputs.get("vm_ipv4")
-                    if ip:
-                        vm.ip_address = ip
-                    vm.status = "running"
-                    vm.cloud_init_user = cloud_init_user
-                    vm.cpu_cores = cpu_cores
-                    vm.memory_mb = memory_mb
-                    vm.disk_gb = disk_gb
-                    vm.updated_at = datetime.now()
-                    db.add(vm)
-                    db.commit()
-
-                    logger.info("vm_provisioned_terraform", vmid=vmid, name=vm_name, persist_db=True)
-
-                except Exception as e:
+                # ← advisory lock released here; VMID is now reserved in DB
+        except Retry:
+            raise  # don't catch retries as errors
+        except Exception as e:
+            with Session(engine) as db:
+                vm = db.exec(select(VM).where(VM.id == vm_id)).first()
+                if vm:
                     vm.status = "error"
                     vm.updated_at = datetime.now()
                     db.add(vm)
                     db.commit()
-                    logger.error("vm_provision_failed", vm_id=vm_id, name=vm_name, error=str(e), exc_info=True, persist_db=True)
-                    raise
-                finally:
-                    shutil.rmtree(work_dir, ignore_errors=True)
+            logger.error("vm_provision_failed", vm_id=vm_id, name=vm_name, error=str(e), exc_info=True, persist_db=True)
+            raise
+
+        # ── Phase 1: Terraform init + apply — no lock held ───────────────────────────
+        #
+        # Read all config values into locals so the DB session can be closed before
+        # the long-running subprocess calls. Keeps connection pool usage minimal.
+        try:
+            with Session(engine) as db:
+                config = db.exec(select(PlatformConfig)).first()
+                token_secret = decrypt_str(config.encrypted_token_secret)
+                api_token = f"{config.token_id}={token_secret}"
+                if not config.ssh_username or not config.encrypted_ssh_password:
+                    raise ValueError(
+                        "SSH credentials not configured. Go to Settings → SSH Credentials and save Proxmox SSH username/password."
+                    )
+                ssh_password = decrypt_str(config.encrypted_ssh_password)
+                ssh_username = config.ssh_username
+                proxmox_url = config.proxmox_url
+                verify_ssl = config.verify_ssl
+
+                user_public_keys: list[str] = []
+                if user_ssh_key_ids:
+                    from src.models import UserSSHKey as UserKey
+                    user_keys = db.exec(
+                        select(UserKey).where(
+                            and_(UserKey.tenant_id == tenant_id, UserKey.id.in_(user_ssh_key_ids))
+                        )
+                    ).all()
+                    user_public_keys = [k.public_key for k in user_keys]
+            # ← DB session closed; all values captured in locals
+
+            img = IMAGE_BY_ID.get(image_id)
+            public_key, private_key_pem = generate_ed25519_keypair()
+
+            os.makedirs(work_dir, exist_ok=True)
+            tf_mgr = TerraformManager(work_dir)
+            rendered = tf_mgr.render_template("proxmox_vm.tf.j2", {
+                "proxmox_url": proxmox_url,
+                "api_token": api_token,
+                "insecure": not verify_ssl,
+                "ssh_username": ssh_username,
+                "ssh_password": ssh_password,
+                "node_name": node_name,
+                "vm_name": vm_name,
+                "vmid": vmid,
+                "cpu_cores": cpu_cores,
+                "memory_mb": memory_mb,
+                "disk_gb": disk_gb,
+                "image_filename": img["filename"],
+                "bridge": bridge,
+                "cloud_init_user": cloud_init_user,
+                "ssh_public_keys": [public_key] + user_public_keys,
+            })
+            tf_mgr.write_config(rendered)
+
+            logger.info("terraform_init_started", vmid=vmid, persist_db=True)
+            tf_mgr.init()
+            logger.info("terraform_apply_started", vmid=vmid, persist_db=True)
+            outputs = tf_mgr.apply()
+
+            state_json = tf_mgr.read_state()
+            initial_ip = outputs.get("vm_ipv4") or None
+
+            # Commit workspace + SSH key immediately after apply.
+            # VM status stays "provisioning" — Phase 2 gates the flip to "running"
+            # on a successful SSH port check. This guarantees the key is in the DB
+            # before the VM is ever visible as ready in the UI.
+            with Session(engine) as db:
+                db.add(TerraformWorkspace(
+                    vm_id=vm_id, tenant_id=tenant_id,
+                    rendered_config=rendered, terraform_state=state_json,
+                ))
+                db.add(VMSSHKey(
+                    vm_id=vm_id, tenant_id=tenant_id,
+                    public_key=public_key,
+                    private_key_encrypted=encrypt_str(private_key_pem),
+                    key_type="ed25519",
+                ))
+                vm = db.exec(select(VM).where(VM.id == vm_id)).first()
+                if vm:
+                    vm.cloud_init_user = cloud_init_user
+                    vm.cpu_cores = cpu_cores
+                    vm.memory_mb = memory_mb
+                    vm.disk_gb = disk_gb
+                    if initial_ip:
+                        vm.ip_address = initial_ip
+                    vm.updated_at = datetime.now()
+                    db.add(vm)
+                db.commit()
+                logger.info("vm_terraform_complete", vmid=vmid, name=vm_name, persist_db=True)
+                provisioned_vmid = vmid
+
+        except Exception as e:
+            with Session(engine) as db:
+                vm = db.exec(select(VM).where(VM.id == vm_id)).first()
+                if vm:
+                    vm.status = "error"
+                    vm.updated_at = datetime.now()
+                    db.add(vm)
+                    db.commit()
+            logger.error("vm_provision_failed", vm_id=vm_id, name=vm_name, error=str(e), exc_info=True, persist_db=True)
+            raise
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+        # ── Phase 2: Readiness check via QEMU guest agent — no direct network needed ──
+        #
+        # The Celery worker runs in Docker and may have no route to the VM's IP, so a
+        # direct TCP probe of port 22 won't work. Instead we use the Proxmox API:
+        # the QEMU guest agent only reports a non-loopback IP *after* cloud-init
+        # finishes and the network stack is up — which also means sshd has started.
+        # Getting an IP from the agent is therefore a reliable readiness signal.
+        #
+        # Polling budget: 120 × 5s = 600s (10 min). Generous enough for slow images.
+        if provisioned_vmid:
+            logger.info("vm_waiting_for_ready", vmid=provisioned_vmid)
+            ip = initial_ip
+            agent_ready = False
+
+            with Session(engine) as poll_db:
+                try:
+                    ip_adapter = _get_adapter(poll_db)
+                    for attempt in range(120):  # up to 600s (120 × 5s)
+                        time.sleep(5)
+                        try:
+                            ip = ip_adapter.get_vm_ip(node_name, provisioned_vmid)
+                            if ip:
+                                agent_ready = True
+                                logger.info("vm_agent_ready", vmid=provisioned_vmid, ip=ip)
+                                break
+                        except Exception:
+                            pass
+                        if attempt % 12 == 11:  # log progress every ~60s
+                            logger.info("vm_still_waiting", vmid=provisioned_vmid, elapsed_s=(attempt + 1) * 5)
+                except Exception as e:
+                    logger.warning("vm_agent_poll_error", vmid=provisioned_vmid, error=str(e))
+
+            with Session(engine) as update_db:
+                vm_record = update_db.exec(select(VM).where(VM.id == vm_id)).first()
+                if vm_record:
+                    if ip:
+                        vm_record.ip_address = ip
+                    vm_record.status = "running" if agent_ready else "provisioning"
+                    vm_record.updated_at = datetime.now()
+                    update_db.add(vm_record)
+                    update_db.commit()
+            logger.info(
+                "vm_provisioned_terraform" if agent_ready else "vm_agent_timeout",
+                vmid=provisioned_vmid, ip=ip, agent_ready=agent_ready, persist_db=True,
+            )
 
 
 @app.task(bind=True, soft_time_limit=600, time_limit=660)
@@ -329,27 +421,55 @@ def destroy_vm(self, vm_id: int, tenant_id: str):
             work_dir = f"/tmp/tf_destroy_{vm_id}"
             try:
                 if workspace:
-                    os.makedirs(work_dir, exist_ok=True)
-                    tf_mgr = TerraformManager(work_dir)
-                    tf_mgr.write_config(workspace.rendered_config)
-                    if workspace.terraform_state:
-                        tf_mgr.write_state(workspace.terraform_state)
-                    tf_mgr.init()
-                    tf_mgr.destroy()
+                    try:
+                        os.makedirs(work_dir, exist_ok=True)
+                        tf_mgr = TerraformManager(work_dir)
+                        tf_mgr.write_config(workspace.rendered_config)
+                        if workspace.terraform_state:
+                            tf_mgr.write_state(workspace.terraform_state)
+                        tf_mgr.init()
+                        tf_mgr.destroy()
+                    except Exception as tf_err:
+                        logger.warning(
+                            "terraform_destroy_failed_fallback",
+                            vm_id=vm_id, vmid=vm.vmid, error=str(tf_err),
+                        )
+                    finally:
+                        # Always run adapter cleanup as a safety net.
+                        # The Proxmox provider may only stop the VM (ACPI) without deleting it,
+                        # or the state may be stale. Force-stop + delete via API to guarantee
+                        # the VM is gone from Proxmox regardless of Terraform outcome.
+                        if vm.vmid and vm.vmid > 0:
+                            adapter = _get_adapter(db)
+                            try:
+                                adapter.stop_vm(vm.node_name, vm.vmid)
+                            except Exception:
+                                pass
+                            # Retry delete: VM may still be stopping after the stop request
+                            for attempt in range(6):  # up to ~15s
+                                try:
+                                    adapter.delete_vm(vm.node_name, vm.vmid)
+                                    break
+                                except Exception:
+                                    if attempt < 5:
+                                        time.sleep(3)
                     db.delete(workspace)
                 else:
-                    # Fallback for VMs without a Terraform workspace (legacy or provisioning error).
-                    # Best-effort: the VM may not exist in Proxmox at all, so ignore errors.
+                    # No Terraform workspace — provisioning failed before state was saved,
+                    # or this is a legacy VM. Best-effort Proxmox API cleanup.
                     if vm.vmid and vm.vmid > 0:
                         adapter = _get_adapter(db)
                         try:
                             adapter.stop_vm(vm.node_name, vm.vmid)
                         except Exception:
                             pass
-                        try:
-                            adapter.delete_vm(vm.node_name, vm.vmid)
-                        except Exception:
-                            pass  # VM never existed in Proxmox (e.g. provisioning failed)
+                        for attempt in range(6):
+                            try:
+                                adapter.delete_vm(vm.node_name, vm.vmid)
+                                break
+                            except Exception:
+                                if attempt < 5:
+                                    time.sleep(3)
 
                 # Delete SSH key record
                 ssh_key = db.exec(

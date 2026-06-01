@@ -16,7 +16,7 @@ from src.middleware import (
     session,
 )
 from src.models import *
-from src.api import api_router, public_router
+from src.api import api_router, public_router, ws_router
 
 load_dotenv()
 
@@ -115,3 +115,4 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 app.include_router(public_router)
 app.include_router(api_router)
+app.include_router(ws_router)  # WebSocket endpoints — no HTTP auth middleware

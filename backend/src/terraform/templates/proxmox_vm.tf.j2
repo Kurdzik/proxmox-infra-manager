@@ -24,13 +24,27 @@ resource "proxmox_virtual_environment_vm" "vm" {
   node_name = "{{ node_name }}"
   vm_id     = {{ vmid }}
 
+  scsi_hardware = "virtio-scsi-pci"
+  boot_order    = ["scsi0"]
+
+  operating_system {
+    type = "l26"
+  }
+
   cpu {
     cores = {{ cpu_cores }}
-    type  = "x86-64-v2-AES"
+    type  = "host"
   }
 
   memory {
     dedicated = {{ memory_mb }}
+  }
+
+  # Serial console — required by Debian/Ubuntu cloud images for cloud-init datasource discovery
+  serial_device {}
+
+  vga {
+    type = "serial0"
   }
 
   disk {
@@ -47,6 +61,8 @@ resource "proxmox_virtual_environment_vm" "vm" {
   }
 
   initialization {
+    datastore_id = "local"
+
     ip_config {
       ipv4 {
         address = "dhcp"

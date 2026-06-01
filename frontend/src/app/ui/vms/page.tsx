@@ -7,6 +7,7 @@ import {
   Button,
   Group,
   Modal,
+  MultiSelect,
   NumberInput,
   Paper,
   Select,
@@ -33,7 +34,7 @@ import {
 } from "@tabler/icons-react";
 import Link from "next/link";
 import { del, get, post } from "@/lib/backendRequests";
-import type { Node, SSHKey, VM, VmImage } from "@/lib/types";
+import type { Node, SSHKey, UserSSHKey, VM, VmImage } from "@/lib/types";
 import { DisplayNotification } from "@/components/Notifications/component";
 
 function OsIcon({ family, size = 32 }: { family: string; size?: number }) {
@@ -105,6 +106,8 @@ export default function VMsPage() {
   const [diskGb, setDiskGb] = useState<number>(20);
   const [cloudInitUser, setCloudInitUser] = useState<string>("ubuntu");
   const [imagesLoading, setImagesLoading] = useState(false);
+  const [userSshKeys, setUserSshKeys] = useState<UserSSHKey[]>([]);
+  const [selectedSshKeyIds, setSelectedSshKeyIds] = useState<string[]>([]);
 
   const pollRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -144,7 +147,7 @@ export default function VMsPage() {
     }
   };
 
-  const openModal = () => {
+  const openModal = async () => {
     setSelectedImage(null);
     setSelectedNode(null);
     setVmName(generateVmName());
@@ -152,8 +155,15 @@ export default function VMsPage() {
     setMemoryMb(2048);
     setDiskGb(20);
     setCloudInitUser("ubuntu");
+    setSelectedSshKeyIds([]);
     setModalOpen(true);
     loadImages();
+    try {
+      const res = await get("keys/list");
+      if (res.status === 200) setUserSshKeys(res.data?.keys || []);
+    } catch {
+      setUserSshKeys([]);
+    }
   };
 
   const handleNodeChange = (node: string | null) => {
@@ -173,6 +183,7 @@ export default function VMsPage() {
         memory_mb: memoryMb,
         disk_gb: diskGb,
         cloud_init_user: cloudInitUser,
+        user_ssh_key_ids: selectedSshKeyIds.map(Number),
       });
       setNotification({ message: res.message || "VM provisioning started", statusCode: res.status });
       if (res.status === 200) { setModalOpen(false); load(); }
@@ -196,6 +207,10 @@ export default function VMsPage() {
   const handleCopySSHKey = async (vmId: number) => {
     try {
       const res = await get(`vms/${vmId}/ssh-key`);
+      if (res.status !== 200 || !res.data) {
+        setNotification({ message: res.detail || "SSH key not found", statusCode: res.status ?? 404 });
+        return;
+      }
       const key: SSHKey = res.data;
       await navigator.clipboard.writeText(key.public_key);
       setNotification({ message: "Public key copied to clipboard", statusCode: 200 });
@@ -450,6 +465,17 @@ export default function VMsPage() {
             description="Default login user injected via cloud-init"
             value={cloudInitUser}
             onChange={(e) => setCloudInitUser(e.currentTarget.value)}
+          />
+
+          <MultiSelect
+            label="Additional SSH Keys"
+            description="Optional — per-VM key is always generated. Select user keys to also inject."
+            placeholder={userSshKeys.length === 0 ? "No keys configured — add them in Account settings" : "Select keys to inject"}
+            data={userSshKeys.map((k) => ({ value: String(k.id), label: k.name }))}
+            value={selectedSshKeyIds}
+            onChange={setSelectedSshKeyIds}
+            clearable
+            disabled={userSshKeys.length === 0}
           />
 
           {selectedImage && selectedNode && (

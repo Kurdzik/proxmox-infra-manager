@@ -163,6 +163,20 @@ class VMSSHKey(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.now)
 
 
+class UserSSHKey(SQLModel, table=True):
+    """User-managed SSH keys for VM provisioning (separate from per-VM terminal keys)."""
+
+    __tablename__ = "user_ssh_keys"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int = Field(index=True, foreign_key="users.id")
+    tenant_id: str = Field(index=True)
+    name: str
+    public_key: str
+    private_key_encrypted: Optional[str] = None  # only present for platform-generated keys
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
 # ---------------------------------------------------------------------------
 # Docker image allowlist (global, platform-managed overrides)
 # ---------------------------------------------------------------------------

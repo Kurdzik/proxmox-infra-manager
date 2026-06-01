@@ -157,3 +157,13 @@ export interface UserInfo {
   tenant_id: string;
   is_admin: boolean;
 }
+
+// ── User SSH Keys ─────────────────────────────────────────────────────────────
+
+export interface UserSSHKey {
+  id: number;
+  name: string;
+  public_key: string;
+  has_private_key: boolean;
+  created_at: string;
+}

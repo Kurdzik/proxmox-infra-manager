@@ -10,24 +10,30 @@ import {
   Group,
   Button,
   PasswordInput,
-  TextInput,
-  Select,
-  Switch,
   Badge,
   Skeleton,
+  Modal,
+  TextInput,
+  Textarea,
+  ActionIcon,
   Alert,
-  Divider,
+  Table,
+  Tooltip,
+  CopyButton,
 } from "@mantine/core";
-import { IconLock, IconServer, IconCheck, IconAlertCircle } from "@tabler/icons-react";
-import { get, post } from "@/lib/backendRequests";
-import type { UserInfo, PlatformConfig } from "@/lib/types";
+import {
+  IconLock,
+  IconKey,
+  IconPlus,
+  IconTrash,
+  IconDownload,
+  IconAlertCircle,
+  IconCheck,
+  IconUpload,
+} from "@tabler/icons-react";
+import { get, post, del } from "@/lib/backendRequests";
+import type { UserInfo, UserSSHKey } from "@/lib/types";
 import { DisplayNotification } from "@/components/Notifications/component";
-
-interface ConnectionTestResult {
-  success: boolean;
-  message: string;
-  nodes?: string[];
-}
 
 export default function AccountPage() {
   const [userInfo, setUserInfo] = useState<UserInfo | null>(null);
@@ -40,38 +46,46 @@ export default function AccountPage() {
   const [changing, setChanging] = useState(false);
   const [passwordNotification, setPasswordNotification] = useState<{ message: string; statusCode: number } | null>(null);
 
-  // Proxmox connection
-  const [proxmoxUrl, setProxmoxUrl] = useState("");
-  const [proxmoxVersion, setProxmoxVersion] = useState("8");
-  const [tokenId, setTokenId] = useState("");
-  const [tokenSecret, setTokenSecret] = useState("");
-  const [verifySsl, setVerifySsl] = useState(false);
-  const [proxmoxLoading, setProxmoxLoading] = useState(false);
-  const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
-  const [proxmoxNotification, setProxmoxNotification] = useState<{ message: string; statusCode: number } | null>(null);
+  // SSH Keys
+  const [sshKeys, setSshKeys] = useState<UserSSHKey[]>([]);
+  const [keysLoading, setKeysLoading] = useState(true);
+  const [keysNotification, setKeysNotification] = useState<{ message: string; statusCode: number } | null>(null);
+
+  // Generate key modal
+  const [generateModalOpen, setGenerateModalOpen] = useState(false);
+  const [generateName, setGenerateName] = useState("");
+  const [generating, setGenerating] = useState(false);
+  const [generatedPrivateKey, setGeneratedPrivateKey] = useState<string | null>(null);
+  const [generatedKeyName, setGeneratedKeyName] = useState<string>("");
+
+  // Import key modal
+  const [importModalOpen, setImportModalOpen] = useState(false);
+  const [importName, setImportName] = useState("");
+  const [importPublicKey, setImportPublicKey] = useState("");
+  const [importing, setImporting] = useState(false);
 
   useEffect(() => {
     const load = async () => {
       try {
         const res = await get("users/me");
-        if (res.status === 200) {
-          setUserInfo(res.data);
-          if (res.data?.is_admin) {
-            const cfg = await get("init/config");
-            if (cfg.status === 200 && cfg.data) {
-              setProxmoxUrl(cfg.data.proxmox_url || "");
-              setProxmoxVersion(cfg.data.proxmox_version || "8");
-              setTokenId(cfg.data.token_id || "");
-              setVerifySsl(cfg.data.verify_ssl ?? false);
-            }
-          }
-        }
+        if (res.status === 200) setUserInfo(res.data);
       } finally {
         setLoading(false);
       }
     };
     load();
+    loadKeys();
   }, []);
+
+  const loadKeys = async () => {
+    setKeysLoading(true);
+    try {
+      const res = await get("keys/list");
+      if (res.status === 200) setSshKeys(res.data?.keys || []);
+    } finally {
+      setKeysLoading(false);
+    }
+  };
 
   const isPasswordFormValid = () =>
     currentPassword && newPassword && newPassword === confirmPassword && newPassword.length >= 8;
@@ -97,53 +111,100 @@ export default function AccountPage() {
     }
   };
 
-  const isProxmoxFormValid = () =>
-    proxmoxUrl.startsWith("https://") && proxmoxVersion && tokenId && tokenSecret;
+  const openGenerateModal = () => {
+    setGenerateName("");
+    setGeneratedPrivateKey(null);
+    setGeneratedKeyName("");
+    setGenerateModalOpen(true);
+  };
 
-  const handleTestConnection = async () => {
-    setProxmoxLoading(true);
-    setTestResult(null);
+  const handleGenerateKey = async () => {
+    if (!generateName.trim()) return;
+    setGenerating(true);
     try {
-      const res = await post("init/test-connection", {
-        proxmox_url: proxmoxUrl,
-        proxmox_version: proxmoxVersion,
-        token_id: tokenId,
-        token_secret: tokenSecret,
-        verify_ssl: verifySsl,
-      });
+      const res = await post("keys/generate", { name: generateName.trim() });
       if (res.status === 200) {
-        setTestResult({ success: true, message: "Connection successful", nodes: res.data?.nodes });
+        setGeneratedPrivateKey(res.data?.private_key_pem || "");
+        setGeneratedKeyName(res.data?.name || generateName);
+        loadKeys();
       } else {
-        setTestResult({ success: false, message: res.detail || "Connection failed" });
+        setKeysNotification({ message: res.detail || "Failed to generate key", statusCode: res.status });
+        setGenerateModalOpen(false);
       }
     } catch (err: any) {
-      setTestResult({ success: false, message: err.message || "Connection failed" });
+      setKeysNotification({ message: err.message, statusCode: 500 });
+      setGenerateModalOpen(false);
     } finally {
-      setProxmoxLoading(false);
+      setGenerating(false);
     }
   };
 
-  const handleSaveProxmox = async () => {
-    setProxmoxLoading(true);
-    setProxmoxNotification(null);
+  const handleCloseGenerateModal = () => {
+    setGenerateModalOpen(false);
+    setGeneratedPrivateKey(null);
+    setGeneratedKeyName("");
+    setGenerateName("");
+  };
+
+  const openImportModal = () => {
+    setImportName("");
+    setImportPublicKey("");
+    setImportModalOpen(true);
+  };
+
+  const handleImportKey = async () => {
+    if (!importName.trim() || !importPublicKey.trim()) return;
+    setImporting(true);
     try {
-      const res = await post("init/configure", {
-        proxmox_url: proxmoxUrl,
-        proxmox_version: proxmoxVersion,
-        token_id: tokenId,
-        token_secret: tokenSecret,
-        verify_ssl: verifySsl,
-      });
-      setProxmoxNotification({ message: res.message || "Configuration saved", statusCode: res.status });
+      const res = await post("keys/import", { name: importName.trim(), public_key: importPublicKey.trim() });
+      setKeysNotification({ message: res.message || "Key imported", statusCode: res.status });
       if (res.status === 200) {
-        setTokenSecret("");
-        setTestResult(null);
+        setImportModalOpen(false);
+        loadKeys();
       }
     } catch (err: any) {
-      setProxmoxNotification({ message: err.message, statusCode: 500 });
+      setKeysNotification({ message: err.message, statusCode: 500 });
     } finally {
-      setProxmoxLoading(false);
+      setImporting(false);
     }
+  };
+
+  const handleDeleteKey = async (keyId: number) => {
+    try {
+      const res = await del(`keys/${keyId}`);
+      setKeysNotification({ message: res.message || "Key deleted", statusCode: res.status });
+      if (res.status === 200) loadKeys();
+    } catch (err: any) {
+      setKeysNotification({ message: err.message, statusCode: 500 });
+    }
+  };
+
+  const handleDownloadPrivateKey = async (keyId: number, keyName: string) => {
+    try {
+      const res = await get(`keys/${keyId}/private`);
+      if (res.status === 200 && res.data?.private_key_pem) {
+        const blob = new Blob([res.data.private_key_pem], { type: "text/plain" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${keyName.replace(/\s+/g, "_")}.pem`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } else {
+        setKeysNotification({ message: res.detail || "Could not retrieve private key", statusCode: res.status ?? 400 });
+      }
+    } catch (err: any) {
+      setKeysNotification({ message: err.message, statusCode: 500 });
+    }
+  };
+
+  const truncateKey = (key: string) => {
+    const parts = key.split(" ");
+    if (parts.length >= 2) {
+      const keyBody = parts[1] || "";
+      return `${parts[0]} ${keyBody.slice(0, 20)}...${keyBody.slice(-8)}`;
+    }
+    return key.slice(0, 40) + "...";
   };
 
   return (
@@ -151,11 +212,12 @@ export default function AccountPage() {
       <Box>
         <Title order={3} mb={4} style={{ color: "var(--lnr-text)" }}>Account</Title>
         <Text size="sm" style={{ color: "var(--lnr-text-muted)" }}>
-          Manage your account settings
+          Manage your account settings and SSH keys
         </Text>
       </Box>
 
-      <Paper p="md" style={{ maxWidth: 480 }}>
+      {/* Account Info */}
+      <Paper p="md">
         <Text size="sm" fw={600} mb="md" style={{ color: "var(--lnr-text)" }}>
           Account Info
         </Text>
@@ -183,7 +245,8 @@ export default function AccountPage() {
         )}
       </Paper>
 
-      <Paper p="md" style={{ maxWidth: 480 }}>
+      {/* Change Password */}
+      <Paper p="md">
         <Text size="sm" fw={600} mb="md" style={{ color: "var(--lnr-text)" }}>
           Change Password
         </Text>
@@ -228,104 +291,221 @@ export default function AccountPage() {
         </Stack>
       </Paper>
 
-      {userInfo?.is_admin && (
-        <Paper p="md" style={{ maxWidth: 480 }}>
-          <Text size="sm" fw={600} mb={4} style={{ color: "var(--lnr-text)" }}>
-            Proxmox Connection
+      {/* SSH Keys */}
+      <Paper p="md">
+        <Group justify="space-between" mb="md">
+          <Box>
+            <Text size="sm" fw={600} style={{ color: "var(--lnr-text)" }}>SSH Keys</Text>
+            <Text size="xs" c="dimmed" mt={2}>
+              Keys added here will be available to inject into VMs during provisioning.
+            </Text>
+          </Box>
+          <Group gap="xs">
+            <Button
+              size="xs"
+              variant="default"
+              leftSection={<IconUpload size={12} />}
+              onClick={openImportModal}
+            >
+              Import
+            </Button>
+            <Button
+              size="xs"
+              leftSection={<IconPlus size={12} />}
+              onClick={openGenerateModal}
+            >
+              Generate keypair
+            </Button>
+          </Group>
+        </Group>
+
+        {keysNotification && (
+          <Box mb="md">
+            <DisplayNotification message={keysNotification.message} statusCode={keysNotification.statusCode} />
+          </Box>
+        )}
+
+        {keysLoading ? (
+          <Skeleton height={80} />
+        ) : sshKeys.length === 0 ? (
+          <Text size="sm" c="dimmed" ta="center" py="lg">
+            No SSH keys yet. Generate a keypair or import a public key.
           </Text>
-          <Text size="xs" c="dimmed" mb="md">
-            Update the Proxmox VE cluster credentials. A new token secret is required to save changes.
-          </Text>
-          {proxmoxNotification && (
-            <Box mb="md">
-              <DisplayNotification message={proxmoxNotification.message} statusCode={proxmoxNotification.statusCode} />
+        ) : (
+          <Table>
+            <Table.Thead>
+              <Table.Tr>
+                <Table.Th>Name</Table.Th>
+                <Table.Th>Public Key</Table.Th>
+                <Table.Th>Type</Table.Th>
+                <Table.Th>Created</Table.Th>
+                <Table.Th />
+              </Table.Tr>
+            </Table.Thead>
+            <Table.Tbody>
+              {sshKeys.map((key) => (
+                <Table.Tr key={key.id}>
+                  <Table.Td>
+                    <Group gap="xs">
+                      <IconKey size={13} color="var(--lnr-text-faint)" />
+                      <Text size="sm" fw={500}>{key.name}</Text>
+                    </Group>
+                  </Table.Td>
+                  <Table.Td>
+                    <Text size="xs" ff="monospace" c="dimmed">{truncateKey(key.public_key)}</Text>
+                  </Table.Td>
+                  <Table.Td>
+                    {key.has_private_key ? (
+                      <Badge color="blue" variant="light" size="xs">keypair</Badge>
+                    ) : (
+                      <Badge color="gray" variant="light" size="xs">public only</Badge>
+                    )}
+                  </Table.Td>
+                  <Table.Td>
+                    <Text size="xs" c="dimmed">{new Date(key.created_at).toLocaleDateString()}</Text>
+                  </Table.Td>
+                  <Table.Td>
+                    <Group gap={4} wrap="nowrap" justify="flex-end">
+                      {key.has_private_key && (
+                        <Tooltip label="Download private key">
+                          <ActionIcon
+                            size="sm"
+                            variant="subtle"
+                            color="blue"
+                            onClick={() => handleDownloadPrivateKey(key.id, key.name)}
+                          >
+                            <IconDownload size={13} />
+                          </ActionIcon>
+                        </Tooltip>
+                      )}
+                      <Tooltip label="Delete key">
+                        <ActionIcon
+                          size="sm"
+                          variant="subtle"
+                          color="red"
+                          onClick={() => handleDeleteKey(key.id)}
+                        >
+                          <IconTrash size={13} />
+                        </ActionIcon>
+                      </Tooltip>
+                    </Group>
+                  </Table.Td>
+                </Table.Tr>
+              ))}
+            </Table.Tbody>
+          </Table>
+        )}
+      </Paper>
+
+      {/* Generate keypair modal */}
+      <Modal
+        opened={generateModalOpen}
+        onClose={handleCloseGenerateModal}
+        title="Generate SSH Keypair"
+        size="md"
+      >
+        {generatedPrivateKey ? (
+          <Stack gap="md">
+            <Alert icon={<IconAlertCircle size={16} />} color="orange" variant="light">
+              <Text size="sm" fw={500}>Save your private key now</Text>
+              <Text size="xs" mt={4}>
+                This is the only time the private key will be shown. It is not stored in plain text.
+              </Text>
+            </Alert>
+            <Box>
+              <Text size="sm" fw={500} mb="xs">Private key for: {generatedKeyName}</Text>
+              <Textarea
+                value={generatedPrivateKey}
+                readOnly
+                autosize
+                minRows={8}
+                maxRows={16}
+                styles={{ input: { fontFamily: "monospace", fontSize: 11 } }}
+              />
             </Box>
-          )}
-          {loading ? (
-            <Skeleton height={200} />
-          ) : (
-            <Stack gap="md">
-              <TextInput
-                label="Proxmox URL"
-                placeholder="https://pve01.internal:8006"
-                required
-                value={proxmoxUrl}
-                onChange={(e) => { setProxmoxUrl(e.currentTarget.value); setTestResult(null); }}
-                description="HTTPS endpoint of your Proxmox cluster"
-                disabled={proxmoxLoading}
-              />
-              <Select
-                label="Proxmox VE Version"
-                required
-                value={proxmoxVersion}
-                onChange={(v) => { setProxmoxVersion(v || "8"); setTestResult(null); }}
-                data={[
-                  { value: "7", label: "Proxmox VE 7.x" },
-                  { value: "8", label: "Proxmox VE 8.x" },
-                ]}
-                disabled={proxmoxLoading}
-              />
-              <TextInput
-                label="Token ID"
-                placeholder="root@pam!infra-manager"
-                required
-                value={tokenId}
-                onChange={(e) => { setTokenId(e.currentTarget.value); setTestResult(null); }}
-                description="Format: user@realm!tokenname"
-                disabled={proxmoxLoading}
-              />
-              <PasswordInput
-                label="Token Secret"
-                placeholder="Enter new token secret to apply changes"
-                required
-                value={tokenSecret}
-                onChange={(e) => { setTokenSecret(e.currentTarget.value); setTestResult(null); }}
-                disabled={proxmoxLoading}
-              />
-              <Switch
-                label="Verify SSL certificate"
-                checked={verifySsl}
-                onChange={(e) => { setVerifySsl(e.currentTarget.checked); setTestResult(null); }}
-                description="Disable for self-signed certificates"
-                disabled={proxmoxLoading}
-              />
+            <Group justify="flex-end">
+              <CopyButton value={generatedPrivateKey}>
+                {({ copied, copy }) => (
+                  <Button
+                    leftSection={copied ? <IconCheck size={14} /> : undefined}
+                    color={copied ? "green" : "blue"}
+                    variant="light"
+                    onClick={copy}
+                  >
+                    {copied ? "Copied!" : "Copy private key"}
+                  </Button>
+                )}
+              </CopyButton>
+              <Button onClick={handleCloseGenerateModal}>Done</Button>
+            </Group>
+          </Stack>
+        ) : (
+          <Stack gap="md">
+            <TextInput
+              label="Key Name"
+              placeholder="e.g. my-laptop"
+              required
+              value={generateName}
+              onChange={(e) => setGenerateName(e.currentTarget.value)}
+              disabled={generating}
+            />
+            <Text size="xs" c="dimmed">
+              An ed25519 keypair will be generated. The private key will be shown once — make sure to save it.
+            </Text>
+            <Group justify="flex-end">
+              <Button variant="default" onClick={handleCloseGenerateModal} disabled={generating}>Cancel</Button>
+              <Button
+                leftSection={<IconKey size={14} />}
+                onClick={handleGenerateKey}
+                loading={generating}
+                disabled={!generateName.trim()}
+              >
+                Generate
+              </Button>
+            </Group>
+          </Stack>
+        )}
+      </Modal>
 
-              {testResult && (
-                <Alert
-                  icon={testResult.success ? <IconCheck size={16} /> : <IconAlertCircle size={16} />}
-                  color={testResult.success ? "green" : "red"}
-                  variant="light"
-                >
-                  <Text size="xs">{testResult.message}</Text>
-                  {testResult.nodes && testResult.nodes.length > 0 && (
-                    <Text size="xs" mt={4}>Nodes: {testResult.nodes.join(", ")}</Text>
-                  )}
-                </Alert>
-              )}
-
-              <Group>
-                <Button
-                  variant="default"
-                  leftSection={<IconServer size={14} />}
-                  onClick={handleTestConnection}
-                  loading={proxmoxLoading}
-                  disabled={!isProxmoxFormValid()}
-                >
-                  Test Connection
-                </Button>
-                <Button
-                  leftSection={<IconCheck size={14} />}
-                  onClick={handleSaveProxmox}
-                  loading={proxmoxLoading}
-                  disabled={!testResult?.success}
-                >
-                  Save
-                </Button>
-              </Group>
-            </Stack>
-          )}
-        </Paper>
-      )}
+      {/* Import public key modal */}
+      <Modal
+        opened={importModalOpen}
+        onClose={() => setImportModalOpen(false)}
+        title="Import SSH Public Key"
+        size="md"
+      >
+        <Stack gap="md">
+          <TextInput
+            label="Key Name"
+            placeholder="e.g. work-laptop"
+            required
+            value={importName}
+            onChange={(e) => setImportName(e.currentTarget.value)}
+            disabled={importing}
+          />
+          <Textarea
+            label="Public Key"
+            placeholder="ssh-ed25519 AAAA... user@host"
+            required
+            value={importPublicKey}
+            onChange={(e) => setImportPublicKey(e.currentTarget.value)}
+            disabled={importing}
+            minRows={3}
+            styles={{ input: { fontFamily: "monospace", fontSize: 11 } }}
+          />
+          <Group justify="flex-end">
+            <Button variant="default" onClick={() => setImportModalOpen(false)} disabled={importing}>Cancel</Button>
+            <Button
+              leftSection={<IconUpload size={14} />}
+              onClick={handleImportKey}
+              loading={importing}
+              disabled={!importName.trim() || !importPublicKey.trim()}
+            >
+              Import
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
     </Stack>
   );
 }
