@@ -5,21 +5,21 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session, select
 
 from src.crypto import hash_password, verify_password
-from src.logger import get_logger, tenant_context
-from src.middleware import engine
+from src.logger import get_logger
 from src.models import (
     ApiResponse,
     ChangePasswordRequest,
     LoginRequest,
+    PlatformConfig,
     RegisterRequest,
-    Session as UserSession,
     TenantLogSettings,
     User,
     UserInfo,
 )
-from src.proxmox import ProxmoxAdapterFactory, ProxmoxCredentials
-from src.models import PlatformConfig, TenantVNet
-from src.crypto import decrypt_str
+from src.models import (
+    Session as UserSession,
+)
+from src.services.tenant_network import ensure_tenant_vnet, get_platform_adapter
 from src.utils import get_db_session, get_user_info
 
 logger = get_logger(__name__)
@@ -50,19 +50,8 @@ def register(request_body: RegisterRequest, request: Request, db_session: Sessio
     config = db_session.exec(select(PlatformConfig)).first()
     if config and config.is_initialized:
         try:
-            token_secret = decrypt_str(config.encrypted_token_secret)
-            credentials = ProxmoxCredentials(
-                url=config.proxmox_url,
-                token_id=config.token_id,
-                token_secret=token_secret,
-                verify_ssl=config.verify_ssl,
-            )
-            adapter = ProxmoxAdapterFactory.create(config.proxmox_version, credentials)
-            vnet_id = f"vnet-{tenant_id[:6]}"
-            adapter.create_vnet(vnet_id=vnet_id, zone="default")
-
-            vnet = TenantVNet(tenant_id=tenant_id, vnet_id=vnet_id, zone="default")
-            db_session.add(vnet)
+            adapter = get_platform_adapter(db_session)
+            ensure_tenant_vnet(db_session, adapter, tenant_id)
         except Exception as e:
             logger.warning("vnet_provisioning_failed", error=str(e))
 

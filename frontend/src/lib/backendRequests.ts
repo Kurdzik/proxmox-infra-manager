@@ -77,6 +77,19 @@ export async function put(
   }).then(handleResponse);
 }
 
+export async function patch(
+  endpoint: string,
+  requestBody?: any,
+  secure: boolean = true,
+): Promise<ApiResponse> {
+  const url = `${conf.backendUrl}/api/${conf.apiVersion}/${endpoint}`;
+  return fetch(url, {
+    method: "PATCH",
+    headers: createHeaders(secure),
+    body: JSON.stringify(requestBody),
+  }).then(handleResponse);
+}
+
 export async function del(endpoint: string, secure: boolean = true): Promise<ApiResponse> {
   const url = `${conf.backendUrl}/api/${conf.apiVersion}/${endpoint}`;
   return fetch(url, { method: "DELETE", headers: createHeaders(secure) }).then(handleResponse);

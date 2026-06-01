@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any, Optional
 from pydantic import BaseModel
 
@@ -71,8 +72,30 @@ class ProvisionVMRequest(BaseModel):
     memory_mb: int = 2048
     disk_gb: int = 20
     cloud_init_user: str = "ubuntu"
-    bridge: Optional[str] = None  # defaults to tenant vnet bridge or vmbr0
+    bridge: Optional[str] = None      # explicit Proxmox bridge override (rarely needed)
+    network_id: Optional[int] = None  # FK to TenantVNet.id; uses default VNet when omitted
     user_ssh_key_ids: list[int] = []
+
+
+# ---------------------------------------------------------------------------
+# Networks / VNets
+# ---------------------------------------------------------------------------
+
+class VNetResponse(BaseModel):
+    id: int
+    vnet_id: str
+    name: str
+    is_default: bool
+    subnet: Optional[str]
+    gateway: Optional[str]
+    dhcp_start: Optional[str]
+    dhcp_end: Optional[str]
+    vm_count: int
+    created_at: datetime
+
+
+class CreateVNetRequest(BaseModel):
+    name: str
 
 
 # ---------------------------------------------------------------------------

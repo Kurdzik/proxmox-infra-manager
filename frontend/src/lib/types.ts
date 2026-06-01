@@ -158,6 +158,21 @@ export interface UserInfo {
   is_admin: boolean;
 }
 
+// ── Networks / VNets ──────────────────────────────────────────────────────────
+
+export interface VNet {
+  id: number;
+  vnet_id: string;
+  name: string;
+  is_default: boolean;
+  subnet?: string;
+  gateway?: string;
+  dhcp_start?: string;
+  dhcp_end?: string;
+  vm_count: number;
+  created_at: string;
+}
+
 // ── User SSH Keys ─────────────────────────────────────────────────────────────
 
 export interface UserSSHKey {

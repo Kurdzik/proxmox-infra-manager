@@ -29,6 +29,8 @@ from src.models.api import (
     ChangePasswordRequest,
     CreateVMTemplateRequest,
     ProvisionVMRequest,
+    VNetResponse,
+    CreateVNetRequest,
     DeployDockerServiceRequest,
     AddFirewallRuleRequest,
     AddDNSEntryRequest,
@@ -45,6 +47,7 @@ __all__ = [
     "ApiResponse", "ErrorResponse", "UserInfo",
     "InitConfigureRequest", "RegisterRequest", "LoginRequest", "ChangePasswordRequest",
     "CreateVMTemplateRequest", "ProvisionVMRequest",
+    "VNetResponse", "CreateVNetRequest",
     "DeployDockerServiceRequest", "AddFirewallRuleRequest",
     "AddDNSEntryRequest", "InstallPluginRequest", "AddAllowedImageRequest",
 ]

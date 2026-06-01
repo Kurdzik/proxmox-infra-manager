@@ -24,8 +24,9 @@ import {
   IconCheck,
   IconAlertCircle,
   IconServerBolt,
+  IconCopy,
 } from "@tabler/icons-react";
-import { post, get } from "@/lib/backendRequests";
+import { post } from "@/lib/backendRequests";
 import { DisplayNotification } from "@/components/Notifications/component";
 
 interface NotificationState {
@@ -42,6 +43,7 @@ interface ConnectionTestResult {
 export default function InitPage() {
   const [active, setActive] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [copiedPrepScript, setCopiedPrepScript] = useState(false);
   const [notification, setNotification] = useState<NotificationState | null>(null);
   const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
 
@@ -97,6 +99,17 @@ export default function InitPage() {
 
   const step1Valid = proxmoxUrl.startsWith("https://") && proxmoxVersion;
   const step2Valid = tokenId && tokenSecret;
+  const nodePrepScript = [
+    "apt update",
+    "apt install -y dnsmasq ifupdown2",
+    "systemctl disable --now dnsmasq",
+  ].join("\n");
+
+  const copyNodePrepScript = async () => {
+    await navigator.clipboard.writeText(nodePrepScript);
+    setCopiedPrepScript(true);
+    setTimeout(() => setCopiedPrepScript(false), 1600);
+  };
 
   return (
     <Flex justify="center" align="center" style={{ minHeight: "100vh", width: "100%", padding: rem(24) }}>
@@ -234,6 +247,54 @@ export default function InitPage() {
                   <Text size="xs">Version: PVE {proxmoxVersion}.x</Text>
                   <Text size="xs">Token: {tokenId}</Text>
                   <Text size="xs">SSL verification: {verifySsl ? "enabled" : "disabled"}</Text>
+                </Box>
+
+                <Box
+                  style={{
+                    border: "1px solid var(--lnr-border)",
+                    borderRadius: 4,
+                    overflow: "hidden",
+                    backgroundColor: "var(--lnr-elevated)",
+                  }}
+                >
+                  <Group
+                    justify="space-between"
+                    align="center"
+                    px="sm"
+                    py={8}
+                    style={{ borderBottom: "1px solid var(--lnr-border)" }}
+                  >
+                    <Box>
+                      <Text size="xs" fw={600} style={{ color: "var(--lnr-text)" }}>
+                        Proxmox node preparation
+                      </Text>
+                      <Text size="xs" style={{ color: "var(--lnr-text-muted)" }}>
+                        Run on every Proxmox node before provisioning SDN-backed VMs.
+                      </Text>
+                    </Box>
+                    <Button
+                      size="xs"
+                      variant="subtle"
+                      leftSection={<IconCopy size={12} />}
+                      onClick={copyNodePrepScript}
+                    >
+                      {copiedPrepScript ? "Copied" : "Copy"}
+                    </Button>
+                  </Group>
+                  <Box
+                    component="pre"
+                    m={0}
+                    p="sm"
+                    style={{
+                      overflowX: "auto",
+                      fontSize: rem(12),
+                      lineHeight: 1.55,
+                      color: "var(--lnr-text)",
+                      backgroundColor: "var(--lnr-surface)",
+                    }}
+                  >
+                    <code>{nodePrepScript}</code>
+                  </Box>
                 </Box>
 
                 {testResult && (

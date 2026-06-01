@@ -65,7 +65,12 @@ resource "proxmox_virtual_environment_vm" "vm" {
 
     ip_config {
       ipv4 {
+{% if static_ip and gateway and prefix_len %}
+        address = "{{ static_ip }}/{{ prefix_len }}"
+        gateway = "{{ gateway }}"
+{% else %}
         address = "dhcp"
+{% endif %}
       }
     }
     user_account {
@@ -75,7 +80,7 @@ resource "proxmox_virtual_environment_vm" "vm" {
   }
 
   agent {
-    enabled = true
+    enabled = false
   }
 }
 

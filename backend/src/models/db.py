@@ -87,11 +87,16 @@ class TenantVNet(SQLModel, table=True):
     __tablename__ = "tenant_vnets"
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    tenant_id: str = Field(index=True, unique=True)
-    vnet_id: str = Field(unique=True)    # e.g. "vnet-a1b2c3"
+    tenant_id: str = Field(index=True)           # no longer unique — one tenant can have many VNets
+    vnet_id: str = Field(unique=True)            # e.g. "vnet-a1b2c3"; unique across all Proxmox SDN
     zone: str
     vlan_tag: Optional[int] = None
-    subnet: Optional[str] = None         # e.g. "10.100.5.0/24"
+    subnet: Optional[str] = Field(default=None, unique=True)  # e.g. "10.100.5.0/24"
+    gateway: Optional[str] = None                # e.g. "10.100.5.1"
+    dhcp_start: Optional[str] = None             # e.g. "10.100.5.100"
+    dhcp_end: Optional[str] = None               # e.g. "10.100.5.199"
+    name: str = Field(default="Default")         # user-visible label
+    is_default: bool = Field(default=False)      # auto-created tenant VNet
     created_at: datetime = Field(default_factory=datetime.now)
 
 
@@ -134,6 +139,7 @@ class VM(SQLModel, table=True):
     ip_address: Optional[str] = None
     cloud_init_user: Optional[str] = None
     template_id: Optional[int] = Field(default=None, foreign_key="vm_templates.id")
+    network_id: Optional[int] = Field(default=None, foreign_key="tenant_vnets.id")
     task_id: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)

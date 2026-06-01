@@ -7,13 +7,13 @@ from datetime import datetime
 from typing import Optional
 
 from celery import Celery
-from celery.exceptions import SoftTimeLimitExceeded
 from sqlalchemy import create_engine, text
 from sqlmodel import Session, and_, select
 
 from src import configure_logger, get_logger, tenant_context
 from src.crypto import decrypt_str, encrypt_str
 from src.models import (
+    VM,
     AllowedImage,
     DNSEntry,
     DockerService,
@@ -23,17 +23,15 @@ from src.models import (
     PlatformConfig,
     Plugin,
     ProxmoxNode,
-    TenantLogSettings,
     TenantVNet,
     TerraformWorkspace,
-    VM,
     VMSSHKey,
-    VMTemplate,
 )
 from src.nginx_manager import NginxConfigManager
 from src.plugin_manager import DockerComposeRunner, IntegrationClient, PluginManifest
 from src.proxmox import ProxmoxAdapterFactory, ProxmoxCredentials
 from src.services.ssh_service import generate_ed25519_keypair
+from src.services.tenant_network import allocate_static_ip, ensure_tenant_vnet, ensure_vnet_on_node
 from src.terraform import TerraformManager
 
 app = Celery("infra-manager-worker")
@@ -69,7 +67,7 @@ def _tenant_provision_slot(tenant_id: str):
         acquired = result.scalar()
         yield acquired
     finally:
-        lock_conn.execute(text(f"SELECT pg_advisory_unlock_all()"))
+        lock_conn.execute(text("SELECT pg_advisory_unlock_all()"))
         lock_conn.close()
 
 
@@ -148,23 +146,43 @@ def sync_cluster_state(self):
                     vm = db.exec(select(VM).where(VM.vmid == vmid)).first()
                     if vm:
                         # Don't overwrite managed transition states — the provision
-                        # task owns "provisioning" until SSH is verified.
+                        # task owns "provisioning" until it completes or times out.
                         if vm.status != "provisioning":
                             vm.status = vm_data.get("status", "stopped")
+                            vm.updated_at = datetime.now()
+                        else:
+                            # Rescue VMs stuck in provisioning (worker crash, agent timeout, etc).
+                            # Use created_at (immutable) — updated_at is refreshed by this loop
+                            # and would never exceed the threshold.
+                            # Threshold: 15 min to allow for Terraform + Phase 2 polling (10 min).
+                            age_minutes = (datetime.now() - vm.created_at).total_seconds() / 60
+                            if age_minutes > 15 and vm_data.get("status") == "running":
+                                vm.status = "running"
+                                vm.updated_at = datetime.now()
+                                logger.warning(
+                                    "vm_rescued_from_stuck_provisioning",
+                                    vmid=vmid, age_minutes=round(age_minutes),
+                                )
                         if vm_data.get("cpus"):
                             vm.cpu_cores = vm_data["cpus"]
                         if vm_data.get("maxmem"):
                             vm.memory_mb = vm_data["maxmem"] // (1024 * 1024)
                         if vm_data.get("maxdisk"):
                             vm.disk_gb = vm_data["maxdisk"] // (1024 * 1024 * 1024)
-                        if vm_data.get("status") == "running":
+                        if vm_data.get("status") == "running" and not vm.ip_address:
+                            resolved_ip: Optional[str] = None
                             try:
-                                ip = adapter.get_vm_ip(node_name, vmid)
-                                if ip:
-                                    vm.ip_address = ip
+                                resolved_ip = adapter.get_vm_ip(node_name, vmid)
                             except Exception:
                                 pass
-                        vm.updated_at = datetime.now()
+                            if not resolved_ip:
+                                try:
+                                    resolved_ip = adapter.get_vm_ip_from_ipam(vmid)
+                                except Exception:
+                                    pass
+                            if resolved_ip:
+                                vm.ip_address = resolved_ip
+                                vm.updated_at = datetime.now()
                         db.add(vm)
             except Exception as e:
                 logger.warning("node_sync_failed", node=node_name, error=str(e))
@@ -189,9 +207,11 @@ def provision_vm(
     disk_gb: int,
     cloud_init_user: str,
     bridge: str,
+    network_id: int | None = None,
     user_ssh_key_ids: list = [],
 ):
     from celery.exceptions import Retry
+
     from src.images import IMAGE_BY_ID
 
     with tenant_context(tenant_id=tenant_id, service_name="worker.provision_vm"):
@@ -199,13 +219,19 @@ def provision_vm(
         vmid: Optional[int] = None
         provisioned_vmid: Optional[int] = None
         initial_ip: Optional[str] = None
+        # Static IP fields — populated in Phase 0 while the advisory lock is held
+        # so concurrent provisions for the same VNet don't race on IP allocation.
+        static_ip: Optional[str] = None
+        static_gateway: Optional[str] = None
+        static_prefix_len: int = 24
 
-        # ── Phase 0: Reserve VMID — advisory lock held for milliseconds only ─────────
+        # ── Phase 0: Reserve VMID + static IP — advisory lock held for milliseconds ──
         #
-        # The lock serialises concurrent VMID allocations for the same tenant so two
-        # simultaneous provisions don't pick the same vmid. It must be released BEFORE
-        # terraform runs — terraform init + apply can take 5-20 minutes and holding
-        # the lock that long causes MaxRetriesExceededError for any second provision.
+        # The lock serialises concurrent allocations for the same tenant so two
+        # simultaneous provisions don't pick the same vmid or static IP.  It must be
+        # released BEFORE terraform runs — terraform init + apply can take 5-20 minutes
+        # and holding the lock that long causes MaxRetriesExceededError for any second
+        # provision.
         try:
             with Session(engine) as db:
                 with _tenant_provision_slot(tenant_id) as acquired:
@@ -226,9 +252,30 @@ def provision_vm(
                     existing_vmids = proxmox_vmids | db_vmids
                     vmid = max(existing_vmids, default=99) + 1
                     vm.vmid = vmid
+
+                    # Allocate a static IP from the VNet's address range so we know
+                    # the IP before Terraform runs — no QEMU guest agent required.
+                    if network_id:
+                        vnet_for_ip = db.exec(
+                            select(TenantVNet).where(TenantVNet.id == network_id)
+                        ).first()
+                        if vnet_for_ip and vnet_for_ip.dhcp_start and vnet_for_ip.dhcp_end:
+                            import ipaddress as _ipaddress
+                            static_ip = allocate_static_ip(db, vnet_for_ip)
+                            static_gateway = vnet_for_ip.gateway
+                            if vnet_for_ip.subnet:
+                                static_prefix_len = _ipaddress.ip_network(
+                                    vnet_for_ip.subnet, strict=False
+                                ).prefixlen
+                            vm.ip_address = static_ip  # reserve IP in DB before Terraform starts
+                            logger.info(
+                                "vm_static_ip_allocated",
+                                vmid=vmid, ip=static_ip, vnet=vnet_for_ip.vnet_id,
+                            )
+
                     db.add(vm)
                     db.commit()
-                # ← advisory lock released here; VMID is now reserved in DB
+                # ← advisory lock released here; VMID + IP are now reserved in DB
         except Retry:
             raise  # don't catch retries as errors
         except Exception as e:
@@ -247,6 +294,38 @@ def provision_vm(
         # Read all config values into locals so the DB session can be closed before
         # the long-running subprocess calls. Keeps connection pool usage minimal.
         try:
+            with Session(engine) as db:
+                # Look up the specific VNet by its Proxmox bridge name (vnet_id).
+                # With multi-VNet support a tenant can have several, so we match on
+                # vnet_id (the bridge) rather than tenant_id.
+                tenant_vnet = db.exec(
+                    select(TenantVNet).where(
+                        and_(TenantVNet.tenant_id == tenant_id, TenantVNet.vnet_id == bridge)
+                    )
+                ).first()
+                if tenant_vnet:
+                    adapter = _get_adapter(db)
+                    if tenant_vnet.is_default:
+                        # Full setup for the default VNet (allocates subnet/DHCP if needed).
+                        tenant_vnet = ensure_tenant_vnet(
+                            db,
+                            adapter,
+                            tenant_id,
+                            target_node=node_name,
+                            commit=True,
+                        )
+                    else:
+                        # Non-default VNet was fully configured at creation time;
+                        # just make sure its bridge is active on this specific node.
+                        ensure_vnet_on_node(db, adapter, tenant_vnet, node_name)
+                    bridge = tenant_vnet.vnet_id
+                    logger.info(
+                        "tenant_vnet_ready",
+                        tenant_id=tenant_id,
+                        vnet=tenant_vnet.vnet_id,
+                        subnet=tenant_vnet.subnet,
+                    )
+
             with Session(engine) as db:
                 config = db.exec(select(PlatformConfig)).first()
                 token_secret = decrypt_str(config.encrypted_token_secret)
@@ -292,6 +371,10 @@ def provision_vm(
                 "bridge": bridge,
                 "cloud_init_user": cloud_init_user,
                 "ssh_public_keys": [public_key] + user_public_keys,
+                # Static IP fields (None → falls back to DHCP in the template)
+                "static_ip": static_ip,
+                "gateway": static_gateway,
+                "prefix_len": static_prefix_len,
             })
             tf_mgr.write_config(rendered)
 
@@ -345,50 +428,112 @@ def provision_vm(
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
-        # ── Phase 2: Readiness check via QEMU guest agent — no direct network needed ──
+        # ── Phase 2: Readiness check ──────────────────────────────────────────────────
         #
-        # The Celery worker runs in Docker and may have no route to the VM's IP, so a
-        # direct TCP probe of port 22 won't work. Instead we use the Proxmox API:
-        # the QEMU guest agent only reports a non-loopback IP *after* cloud-init
-        # finishes and the network stack is up — which also means sshd has started.
-        # Getting an IP from the agent is therefore a reliable readiness signal.
+        # Two strategies depending on whether we pre-allocated a static IP:
         #
-        # Polling budget: 120 × 5s = 600s (10 min). Generous enough for slow images.
+        # A) Static IP — IP is already known; just wait for Proxmox to report the VM
+        #    as "running" (power state). No QEMU guest agent required.
+        #    Budget: 120 × 5s = 600s (10 min).
+        #
+        # B) DHCP — try QEMU guest agent first; fall back to Proxmox IPAM; last resort
+        #    is native power-state check via get_vm_status().
+        #
+        # In either case we never leave the VM in "provisioning" — sync_cluster_state
+        # protects that state and it would require manual DB intervention to recover.
         if provisioned_vmid:
-            logger.info("vm_waiting_for_ready", vmid=provisioned_vmid)
-            ip = initial_ip
-            agent_ready = False
+            logger.info("vm_waiting_for_ready", vmid=provisioned_vmid, has_static_ip=bool(static_ip))
+            ip = static_ip or initial_ip
+            final_status = "error"
 
             with Session(engine) as poll_db:
                 try:
-                    ip_adapter = _get_adapter(poll_db)
-                    for attempt in range(120):  # up to 600s (120 × 5s)
-                        time.sleep(5)
-                        try:
-                            ip = ip_adapter.get_vm_ip(node_name, provisioned_vmid)
-                            if ip:
-                                agent_ready = True
-                                logger.info("vm_agent_ready", vmid=provisioned_vmid, ip=ip)
-                                break
-                        except Exception:
-                            pass
-                        if attempt % 12 == 11:  # log progress every ~60s
-                            logger.info("vm_still_waiting", vmid=provisioned_vmid, elapsed_s=(attempt + 1) * 5)
+                    poll_adapter = _get_adapter(poll_db)
+
+                    if static_ip:
+                        # ── Strategy A: wait for power state only ──────────────────
+                        for attempt in range(120):
+                            time.sleep(5)
+                            try:
+                                power = poll_adapter.get_vm_status(node_name, provisioned_vmid)
+                                if power == "running":
+                                    final_status = "running"
+                                    logger.info(
+                                        "vm_ready_static_ip",
+                                        vmid=provisioned_vmid, ip=static_ip,
+                                        elapsed_s=(attempt + 1) * 5,
+                                    )
+                                    break
+                            except Exception:
+                                pass
+                            if attempt % 12 == 11:
+                                logger.info("vm_still_waiting", vmid=provisioned_vmid, elapsed_s=(attempt + 1) * 5)
+                        else:
+                            # Timeout — check one last time
+                            try:
+                                power = poll_adapter.get_vm_status(node_name, provisioned_vmid)
+                                final_status = "running" if power == "running" else "error"
+                            except Exception:
+                                pass
+                            logger.warning(
+                                "vm_static_ip_power_timeout",
+                                vmid=provisioned_vmid, ip=static_ip, final_status=final_status,
+                            )
+                    else:
+                        # ── Strategy B: QEMU agent → IPAM → power state ─────────────
+                        agent_ready = False
+                        for attempt in range(120):
+                            time.sleep(5)
+                            try:
+                                found_ip = poll_adapter.get_vm_ip(node_name, provisioned_vmid)
+                                if found_ip:
+                                    ip = found_ip
+                                    agent_ready = True
+                                    logger.info("vm_agent_ready", vmid=provisioned_vmid, ip=ip)
+                                    break
+                            except Exception:
+                                try:
+                                    found_ip = poll_adapter.get_vm_ip_from_ipam(provisioned_vmid)
+                                    if found_ip:
+                                        ip = found_ip
+                                        agent_ready = True
+                                        logger.info("vm_ip_from_ipam", vmid=provisioned_vmid, ip=ip)
+                                        break
+                                except Exception:
+                                    pass
+                            if attempt % 12 == 11:
+                                logger.info("vm_still_waiting", vmid=provisioned_vmid, elapsed_s=(attempt + 1) * 5)
+
+                        if agent_ready:
+                            final_status = "running"
+                        else:
+                            try:
+                                proxmox_power = poll_adapter.get_vm_status(node_name, provisioned_vmid)
+                                final_status = "running" if proxmox_power == "running" else "error"
+                                logger.info(
+                                    "vm_agent_timeout_proxmox_fallback",
+                                    vmid=provisioned_vmid, proxmox_status=proxmox_power, ip=ip,
+                                )
+                            except Exception as e:
+                                final_status = "error"
+                                logger.warning("vm_status_check_failed", vmid=provisioned_vmid, error=str(e))
+
                 except Exception as e:
-                    logger.warning("vm_agent_poll_error", vmid=provisioned_vmid, error=str(e))
+                    logger.warning("vm_readiness_poll_error", vmid=provisioned_vmid, error=str(e))
 
             with Session(engine) as update_db:
                 vm_record = update_db.exec(select(VM).where(VM.id == vm_id)).first()
                 if vm_record:
                     if ip:
                         vm_record.ip_address = ip
-                    vm_record.status = "running" if agent_ready else "provisioning"
+                    vm_record.status = final_status
                     vm_record.updated_at = datetime.now()
                     update_db.add(vm_record)
                     update_db.commit()
             logger.info(
-                "vm_provisioned_terraform" if agent_ready else "vm_agent_timeout",
-                vmid=provisioned_vmid, ip=ip, agent_ready=agent_ready, persist_db=True,
+                "vm_provisioned_terraform",
+                vmid=provisioned_vmid, ip=ip, final_status=final_status,
+                static_ip=bool(static_ip), persist_db=True,
             )
 
 
@@ -937,6 +1082,7 @@ def cleanup_old_logs(self, tenant_id: str, log_retention_period_d: int, log_size
     with tenant_context(tenant_id=tenant_id, service_name="worker.log_cleanup"):
         with Session(engine) as db:
             from datetime import timedelta
+
             from sqlalchemy import delete as sa_delete
             cutoff = datetime.now() - timedelta(days=log_retention_period_d)
             db.exec(

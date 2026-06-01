@@ -76,6 +76,25 @@ class BaseProxmoxAdapter:
         """Return the first non-loopback IPv4 address reported by the QEMU guest agent, or None."""
         self._not_implemented()
 
+    def get_vm_status(self, node: str, vmid: int) -> str:
+        """Return VM power state (running/stopped/paused) without requiring QEMU guest agent."""
+        self._not_implemented()
+
+    def get_vm_config(self, node: str, vmid: int) -> dict:
+        """Return the full configuration of a QEMU VM."""
+        self._not_implemented()
+
+    def get_vm_mac(self, node: str, vmid: int) -> Optional[str]:
+        """Return the MAC address of net0 for a QEMU VM, or None."""
+        self._not_implemented()
+
+    def get_vm_ip_from_ipam(self, vmid: int) -> Optional[str]:
+        """Return the IPv4 address assigned to vmid from the Proxmox IPAM, or None.
+
+        Requires Proxmox SDN with IPAM configured. Works without the QEMU guest agent.
+        """
+        self._not_implemented()
+
     # ------------------------------------------------------------------
     # LXC Containers
     # ------------------------------------------------------------------
@@ -139,16 +158,79 @@ class BaseProxmoxAdapter:
     def list_vnets(self) -> list[dict]:
         self._not_implemented()
 
+    def get_sdn_zone(self, zone: str) -> dict:
+        self._not_implemented()
+
+    def list_sdn_zones(self) -> list[dict]:
+        self._not_implemented()
+
+    def create_sdn_zone(
+        self,
+        zone: str,
+        zone_type: str = "simple",
+        dhcp: Optional[str] = None,
+        ipam: Optional[str] = None,
+        nodes: Optional[str] = None,
+    ) -> dict:
+        self._not_implemented()
+
+    def update_sdn_zone(self, zone: str, config: dict) -> dict:
+        self._not_implemented()
+
     def create_vnet(self, vnet_id: str, zone: str, tag: Optional[int] = None) -> dict:
+        self._not_implemented()
+
+    def get_vnet(self, vnet_id: str) -> dict:
         self._not_implemented()
 
     def delete_vnet(self, vnet_id: str) -> None:
         self._not_implemented()
 
-    def assign_vnet_to_ct(self, node: str, vmid: int, vnet_id: str, interface: str = "eth0") -> None:
+    def list_sdn_subnets(self, vnet_id: str) -> list[dict]:
         self._not_implemented()
 
-    def assign_vnet_to_vm(self, node: str, vmid: int, vnet_id: str, interface: str = "net0") -> None:
+    def create_sdn_subnet(
+        self,
+        vnet_id: str,
+        subnet: str,
+        gateway: str,
+        dhcp_start: str,
+        dhcp_end: str,
+        snat: bool = True,
+    ) -> dict:
+        self._not_implemented()
+
+    def update_sdn_subnet(self, vnet_id: str, subnet_id: str, config: dict) -> dict:
+        self._not_implemented()
+
+    def apply_sdn(self) -> dict | str:
+        self._not_implemented()
+
+    def get_task_log(self, node: str, upid: str) -> list[dict]:
+        self._not_implemented()
+
+    def list_node_network(self, node: str) -> list[dict]:
+        self._not_implemented()
+
+    def list_node_sdn_zone_content(self, node: str, zone: str) -> list[dict]:
+        self._not_implemented()
+
+    def assign_vnet_to_ct(
+        self,
+        node: str,
+        vmid: int,
+        vnet_id: str,
+        interface: str = "eth0",
+    ) -> None:
+        self._not_implemented()
+
+    def assign_vnet_to_vm(
+        self,
+        node: str,
+        vmid: int,
+        vnet_id: str,
+        interface: str = "net0",
+    ) -> None:
         self._not_implemented()
 
     # ------------------------------------------------------------------
@@ -181,7 +263,12 @@ class BaseProxmoxAdapter:
     def get_storage_info(self, storage_id: str) -> dict:
         self._not_implemented()
 
-    def list_storage_content(self, node: str, storage: str, content_type: str = "iso") -> list[dict]:
+    def list_storage_content(
+        self,
+        node: str,
+        storage: str,
+        content_type: str = "iso",
+    ) -> list[dict]:
         """List files in a storage volume. Returns list of dicts with 'volid', 'size', etc."""
         self._not_implemented()
 
@@ -189,6 +276,12 @@ class BaseProxmoxAdapter:
         """Trigger an ISO download via Proxmox download-url API. Returns the UPID task ID."""
         self._not_implemented()
 
-    def wait_for_task(self, node: str, upid: str, poll_interval: int = 5, timeout: int = 900) -> None:
+    def wait_for_task(
+        self,
+        node: str,
+        upid: str,
+        poll_interval: int = 5,
+        timeout: int = 900,
+    ) -> None:
         """Block until a Proxmox task (UPID) completes, raising on failure."""
         self._not_implemented()

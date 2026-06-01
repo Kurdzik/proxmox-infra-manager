@@ -33,6 +33,7 @@ const infrastructureItems: NavItem[] = [
   { icon: <IconLayoutDashboard size={16} stroke={1.5} />, label: "Dashboard", route: "/ui/dashboard" },
   { icon: <IconServer size={16} stroke={1.5} />, label: "Nodes", route: "/ui/nodes" },
   { icon: <IconDeviceDesktop size={16} stroke={1.5} />, label: "Virtual Machines", route: "/ui/vms" },
+  { icon: <IconNetwork size={16} stroke={1.5} />, label: "Networks", route: "/ui/networks" },
 ];
 
 const servicesItems: NavItem[] = [

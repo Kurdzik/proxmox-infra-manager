@@ -27,14 +27,15 @@ import {
   IconCloud,
   IconDeviceDesktop,
   IconDownload,
+  IconEdit,
   IconKey,
   IconPlus,
   IconTerminal,
   IconTrash,
 } from "@tabler/icons-react";
 import Link from "next/link";
-import { del, get, post } from "@/lib/backendRequests";
-import type { Node, SSHKey, UserSSHKey, VM, VmImage } from "@/lib/types";
+import { del, get, patch, post } from "@/lib/backendRequests";
+import type { Node, SSHKey, UserSSHKey, VM, VmImage, VNet } from "@/lib/types";
 import { DisplayNotification } from "@/components/Notifications/component";
 
 function OsIcon({ family, size = 32 }: { family: string; size?: number }) {
@@ -108,6 +109,10 @@ export default function VMsPage() {
   const [imagesLoading, setImagesLoading] = useState(false);
   const [userSshKeys, setUserSshKeys] = useState<UserSSHKey[]>([]);
   const [selectedSshKeyIds, setSelectedSshKeyIds] = useState<string[]>([]);
+  const [networks, setNetworks] = useState<VNet[]>([]);
+  const [selectedNetworkId, setSelectedNetworkId] = useState<string | null>(null);
+  const [editIpVm, setEditIpVm] = useState<VM | null>(null);
+  const [editIpValue, setEditIpValue] = useState("");
 
   const pollRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -156,13 +161,23 @@ export default function VMsPage() {
     setDiskGb(20);
     setCloudInitUser("ubuntu");
     setSelectedSshKeyIds([]);
+    setSelectedNetworkId(null);
     setModalOpen(true);
     loadImages();
-    try {
-      const res = await get("keys/list");
-      if (res.status === 200) setUserSshKeys(res.data?.keys || []);
-    } catch {
+    const [keysRes, netsRes] = await Promise.allSettled([
+      get("keys/list"),
+      get("networks/list"),
+    ]);
+    if (keysRes.status === "fulfilled" && keysRes.value.status === 200) {
+      setUserSshKeys(keysRes.value.data?.keys || []);
+    } else {
       setUserSshKeys([]);
+    }
+    if (netsRes.status === "fulfilled" && netsRes.value.status === 200) {
+      const nets: VNet[] = netsRes.value.data?.networks || [];
+      setNetworks(nets);
+      const def = nets.find((n) => n.is_default);
+      if (def) setSelectedNetworkId(String(def.id));
     }
   };
 
@@ -183,6 +198,7 @@ export default function VMsPage() {
         memory_mb: memoryMb,
         disk_gb: diskGb,
         cloud_init_user: cloudInitUser,
+        network_id: selectedNetworkId ? Number(selectedNetworkId) : undefined,
         user_ssh_key_ids: selectedSshKeyIds.map(Number),
       });
       setNotification({ message: res.message || "VM provisioning started", statusCode: res.status });
@@ -216,6 +232,22 @@ export default function VMsPage() {
       setNotification({ message: "Public key copied to clipboard", statusCode: 200 });
     } catch (err: any) {
       setNotification({ message: err.message || "Failed to copy SSH key", statusCode: 500 });
+    }
+  };
+
+  const handleSetIp = async () => {
+    if (!editIpVm || !editIpValue.trim()) return;
+    try {
+      const res = await patch(`vms/${editIpVm.id}/ip`, { ip_address: editIpValue.trim() });
+      if (res.status === 200) {
+        setNotification({ message: "IP address updated", statusCode: 200 });
+        setEditIpVm(null);
+        load();
+      } else {
+        setNotification({ message: res.detail || "Failed to update IP", statusCode: res.status ?? 500 });
+      }
+    } catch (err: any) {
+      setNotification({ message: err.message || "Failed to update IP", statusCode: 500 });
     }
   };
 
@@ -279,7 +311,21 @@ export default function VMsPage() {
                       {vm.memory_mb != null ? `${Math.round(vm.memory_mb / 1024)} GB` : "—"}
                     </Text>
                   </Table.Td>
-                  <Table.Td><Text size="sm" c="dimmed">{vm.ip_address || "—"}</Text></Table.Td>
+                  <Table.Td>
+                    <Group gap={4} wrap="nowrap">
+                      <Text size="sm" c={vm.ip_address ? undefined : "dimmed"}>{vm.ip_address || "—"}</Text>
+                      {vm.status === "running" && (
+                        <Tooltip label="Set IP address" withArrow position="top">
+                          <UnstyledButton
+                            onClick={() => { setEditIpVm(vm); setEditIpValue(vm.ip_address || ""); }}
+                            style={{ display: "flex", alignItems: "center", opacity: 0.5 }}
+                          >
+                            <IconEdit size={12} />
+                          </UnstyledButton>
+                        </Tooltip>
+                      )}
+                    </Group>
+                  </Table.Td>
                   <Table.Td>
                     <Badge color={statusColor(vm.status)} variant="light" size="xs">{vm.status}</Badge>
                   </Table.Td>
@@ -326,6 +372,31 @@ export default function VMsPage() {
           </Table>
         )}
       </Paper>
+
+      {/* Edit IP modal */}
+      <Modal
+        opened={!!editIpVm}
+        onClose={() => setEditIpVm(null)}
+        title={`Set IP — ${editIpVm?.name || ""}`}
+        size="sm"
+      >
+        <Stack gap="md">
+          <Text size="sm" c="dimmed">
+            Enter the IP address assigned to this VM. You can find it in the Proxmox console or via DHCP leases.
+          </Text>
+          <TextInput
+            label="IP Address"
+            placeholder="10.100.1.100"
+            value={editIpValue}
+            onChange={(e) => setEditIpValue(e.currentTarget.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleSetIp()}
+          />
+          <Group justify="flex-end">
+            <Button variant="subtle" onClick={() => setEditIpVm(null)}>Cancel</Button>
+            <Button onClick={handleSetIp} disabled={!editIpValue.trim()}>Save</Button>
+          </Group>
+        </Stack>
+      </Modal>
 
       {/* Provision modal */}
       <Modal
@@ -465,6 +536,19 @@ export default function VMsPage() {
             description="Default login user injected via cloud-init"
             value={cloudInitUser}
             onChange={(e) => setCloudInitUser(e.currentTarget.value)}
+          />
+
+          <Select
+            label="Network"
+            description="VNet the VM will join — each network has its own DHCP subnet"
+            placeholder="Select a network"
+            data={networks.map((n) => ({
+              value: String(n.id),
+              label: n.is_default ? `${n.name} (default)${n.subnet ? ` — ${n.subnet}` : ""}` : `${n.name}${n.subnet ? ` — ${n.subnet}` : ""}`,
+            }))}
+            value={selectedNetworkId}
+            onChange={setSelectedNetworkId}
+            clearable={false}
           />
 
           <MultiSelect

@@ -2,18 +2,23 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, and_, select
 
 from src.images import COMMON_IMAGES, IMAGE_BY_ID
+from src.logger import get_logger, tenant_context
 from src.models import (
+    VM,
     ApiResponse,
     CreateVMTemplateRequest,
     PlatformConfig,
     ProvisionVMRequest,
     TenantVNet,
     UserInfo,
-    VM,
     VMSSHKey,
     VMTemplate,
 )
-from src.logger import get_logger, tenant_context
+from src.services.tenant_network import (
+    TenantNetworkError,
+    ensure_tenant_vnet,
+    get_platform_adapter,
+)
 from src.utils import get_db_session, get_user_info
 
 logger = get_logger(__name__)
@@ -128,13 +133,45 @@ def provision_vm(
                 detail="Only cloud-image type images are supported for provisioning",
             )
 
-        # Resolve bridge: tenant vnet > request override > default
+        # Resolve bridge: explicit override → specific VNet by ID → default tenant VNet.
         bridge = request.bridge
+        resolved_network_id: int | None = None
         if not bridge:
-            vnet = db_session.exec(
-                select(TenantVNet).where(TenantVNet.tenant_id == user_info.tenant_id)
-            ).first()
-            bridge = vnet.vnet_id if vnet else "vmbr0"
+            try:
+                adapter = get_platform_adapter(db_session)
+                if request.network_id is not None:
+                    vnet = db_session.exec(
+                        select(TenantVNet).where(
+                            and_(
+                                TenantVNet.id == request.network_id,
+                                TenantVNet.tenant_id == user_info.tenant_id,
+                            )
+                        )
+                    ).first()
+                    if not vnet:
+                        raise HTTPException(
+                            status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"Network {request.network_id} not found",
+                        )
+                    bridge = vnet.vnet_id
+                    resolved_network_id = vnet.id
+                else:
+                    vnet = ensure_tenant_vnet(
+                        db_session,
+                        adapter,
+                        user_info.tenant_id,
+                        commit=True,
+                    )
+                    bridge = vnet.vnet_id
+                    resolved_network_id = vnet.id
+            except HTTPException:
+                raise
+            except TenantNetworkError as exc:
+                db_session.rollback()
+                status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+                if "not initialized" not in str(exc).lower():
+                    status_code = status.HTTP_502_BAD_GATEWAY
+                raise HTTPException(status_code=status_code, detail=str(exc)) from exc
 
         vm = VM(
             tenant_id=user_info.tenant_id,
@@ -146,6 +183,7 @@ def provision_vm(
             memory_mb=request.memory_mb,
             disk_gb=request.disk_gb,
             cloud_init_user=request.cloud_init_user,
+            network_id=resolved_network_id,
         )
         db_session.add(vm)
         db_session.commit()
@@ -164,6 +202,7 @@ def provision_vm(
                 "disk_gb": request.disk_gb,
                 "cloud_init_user": request.cloud_init_user,
                 "bridge": bridge,
+                "network_id": resolved_network_id,
                 "user_ssh_key_ids": request.user_ssh_key_ids,
             },
             ignore_result=True,
@@ -174,6 +213,32 @@ def provision_vm(
         db_session.commit()
 
         return ApiResponse(message="VM provisioning queued", data={"task_id": task.id, "vm_id": vm.id})
+
+
+@router.patch("/{vm_id}/ip", response_model=ApiResponse)
+def set_vm_ip(
+    vm_id: int,
+    body: dict,
+    db_session: Session = Depends(get_db_session),
+    user_info: UserInfo = Depends(get_user_info),
+):
+    """Manually set the IP address for a VM (useful when guest agent is unavailable)."""
+    with tenant_context(tenant_id=user_info.tenant_id, service_name="api.vms"):
+        vm = db_session.exec(
+            select(VM).where(and_(VM.tenant_id == user_info.tenant_id, VM.id == vm_id))
+        ).first()
+        if not vm:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="VM not found")
+
+        ip = (body.get("ip_address") or "").strip()
+        if not ip:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="ip_address is required")
+
+        vm.ip_address = ip
+        db_session.add(vm)
+        db_session.commit()
+        logger.info("vm_ip_manually_set", vm_id=vm_id, ip=ip)
+        return ApiResponse(message="IP address updated", data={"vm_id": vm_id, "ip_address": ip})
 
 
 @router.delete("/{vm_id}", response_model=ApiResponse)
