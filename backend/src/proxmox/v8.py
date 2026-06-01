@@ -51,6 +51,21 @@ class ProxmoxVE8Adapter(BaseProxmoxAdapter):
             json={"command": command},
         )
 
+    def get_vm_ip(self, node: str, vmid: int) -> Optional[str]:
+        """Return the first non-loopback IPv4 address via QEMU guest agent, or None."""
+        interfaces = self._request("GET", f"/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces")
+        if not isinstance(interfaces, list):
+            interfaces = interfaces.get("result", []) if isinstance(interfaces, dict) else []
+        for iface in interfaces:
+            if iface.get("name") == "lo":
+                continue
+            for addr in iface.get("ip-addresses", []):
+                if addr.get("ip-address-type") == "ipv4":
+                    ip = addr.get("ip-address", "")
+                    if not ip.startswith("127."):
+                        return ip
+        return None
+
     # ------------------------------------------------------------------
     # LXC Containers
     # ------------------------------------------------------------------
@@ -76,6 +91,21 @@ class ProxmoxVE8Adapter(BaseProxmoxAdapter):
             f"/nodes/{node}/lxc/{vmid}/exec",
             json={"command": command},
         )
+
+    def get_ct_ip(self, node: str, vmid: int) -> Optional[str]:
+        """Return the first non-loopback IPv4 address from LXC interfaces, or None."""
+        interfaces = self._request("GET", f"/nodes/{node}/lxc/{vmid}/interfaces")
+        if not isinstance(interfaces, list):
+            return None
+        for iface in interfaces:
+            if iface.get("name") == "lo":
+                continue
+            inet = iface.get("inet", "")
+            if inet:
+                ip = inet.split("/")[0]
+                if not ip.startswith("127."):
+                    return ip
+        return None
 
     # ------------------------------------------------------------------
     # Firewall
@@ -167,8 +197,22 @@ class ProxmoxVE8Adapter(BaseProxmoxAdapter):
         self._request("DELETE", f"/cluster/sdn/dns/{zone}/records/{hostname}")
 
     # ------------------------------------------------------------------
+    # VM config update
+    # ------------------------------------------------------------------
+
+    def update_vm_config(self, node: str, vmid: int, config: dict) -> dict:
+        return self._request("PUT", f"/nodes/{node}/qemu/{vmid}/config", json=config)
+
+    def resize_disk(self, node: str, vmid: int, disk: str, size: str) -> dict:
+        """Resize a VM disk. size is absolute, e.g. '20G'."""
+        return self._request("PUT", f"/nodes/{node}/qemu/{vmid}/resize", json={"disk": disk, "size": size})
+
+    # ------------------------------------------------------------------
     # Storage / ISO management
     # ------------------------------------------------------------------
+
+    def get_storage_info(self, storage_id: str) -> dict:
+        return self._request("GET", f"/storage/{storage_id}")
 
     def list_storage_content(self, node: str, storage: str, content_type: str = "iso") -> list[dict]:
         return self._request("GET", f"/nodes/{node}/storage/{storage}/content", params={"content": content_type})

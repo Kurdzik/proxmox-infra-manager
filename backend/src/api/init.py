@@ -112,8 +112,36 @@ def get_config(
             "proxmox_version": config.proxmox_version,
             "token_id": config.token_id,
             "verify_ssl": config.verify_ssl,
+            "ssh_username": config.ssh_username,
+            "ssh_configured": bool(config.ssh_username and config.encrypted_ssh_password),
         },
     )
+
+
+@router.post("/configure-ssh", response_model=ApiResponse)
+def configure_ssh(
+    request: dict,
+    db_session: Session = Depends(get_db_session),
+    user_info=Depends(get_user_info),
+):
+    require_admin(user_info)
+    config = db_session.exec(select(PlatformConfig)).first()
+    if not config or not config.is_initialized:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Platform not configured")
+
+    ssh_username = request.get("ssh_username", "").strip()
+    ssh_password = request.get("ssh_password", "").strip()
+    if not ssh_username or not ssh_password:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="ssh_username and ssh_password are required")
+
+    config.ssh_username = ssh_username
+    config.encrypted_ssh_password = encrypt_str(ssh_password)
+    config.updated_at = __import__("datetime").datetime.now()
+    db_session.add(config)
+    db_session.commit()
+
+    logger.info("ssh_credentials_updated", username=ssh_username)
+    return ApiResponse(message="SSH credentials saved")
 
 
 @router.post("/reset", response_model=ApiResponse)

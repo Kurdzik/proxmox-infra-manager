@@ -13,6 +13,13 @@ RUN apt update && apt install -y --no-install-recommends \
     tzdata \
     && rm -rf /var/lib/apt/lists/*
 
+ENV TERRAFORM_VERSION=1.9.5
+RUN apt-get update && apt-get install -y wget unzip \
+    && wget -q https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip \
+    && unzip terraform_${TERRAFORM_VERSION}_linux_amd64.zip -d /usr/local/bin/ \
+    && rm terraform_${TERRAFORM_VERSION}_linux_amd64.zip \
+    && chmod +x /usr/local/bin/terraform
+
 RUN groupadd -g 1000 appuser && useradd -u 1000 -g 1000 -m -s /sbin/nologin appuser
 
 ADD . /app

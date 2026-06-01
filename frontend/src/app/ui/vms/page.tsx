@@ -1,13 +1,39 @@
 "use client";
 
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
-  Title, Text, Box, Stack, Paper, Group, Badge, Button,
-  Table, Modal, Select, TextInput, Skeleton, UnstyledButton, rem, Tooltip,
+  Badge,
+  Box,
+  Button,
+  Group,
+  Modal,
+  NumberInput,
+  Paper,
+  Select,
+  Skeleton,
+  Stack,
+  Table,
+  Text,
+  TextInput,
+  Title,
+  Tooltip,
+  UnstyledButton,
+  rem,
 } from "@mantine/core";
-import { IconPlus, IconTrash, IconDeviceDesktop, IconCheck, IconDownload, IconCircleCheck } from "@tabler/icons-react";
-import { get, post, del } from "@/lib/backendRequests";
-import type { VM, VmImage, Node } from "@/lib/types";
+import {
+  IconCheck,
+  IconCircleCheck,
+  IconCloud,
+  IconDeviceDesktop,
+  IconDownload,
+  IconKey,
+  IconPlus,
+  IconTerminal,
+  IconTrash,
+} from "@tabler/icons-react";
+import Link from "next/link";
+import { del, get, post } from "@/lib/backendRequests";
+import type { Node, SSHKey, VM, VmImage } from "@/lib/types";
 import { DisplayNotification } from "@/components/Notifications/component";
 
 function OsIcon({ family, size = 32 }: { family: string; size?: number }) {
@@ -16,9 +42,9 @@ function OsIcon({ family, size = 32 }: { family: string; size?: number }) {
       <svg width={size} height={size} viewBox="0 0 24 24" fill="none">
         <circle cx="12" cy="12" r="11" fill="#E95420" />
         <circle cx="12" cy="12" r="4" fill="white" />
-        <circle cx="12" cy="4"  r="2" fill="white" />
+        <circle cx="12" cy="4" r="2" fill="white" />
         <circle cx="19.5" cy="16" r="2" fill="white" />
-        <circle cx="4.5"  cy="16" r="2" fill="white" />
+        <circle cx="4.5" cy="16" r="2" fill="white" />
       </svg>
     );
   }
@@ -74,6 +100,10 @@ export default function VMsPage() {
   const [selectedImage, setSelectedImage] = useState<VmImage | null>(null);
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
   const [vmName, setVmName] = useState("");
+  const [cpuCores, setCpuCores] = useState<number>(2);
+  const [memoryMb, setMemoryMb] = useState<number>(2048);
+  const [diskGb, setDiskGb] = useState<number>(20);
+  const [cloudInitUser, setCloudInitUser] = useState<string>("ubuntu");
   const [imagesLoading, setImagesLoading] = useState(false);
 
   const pollRef = useRef<NodeJS.Timeout | null>(null);
@@ -88,7 +118,10 @@ export default function VMsPage() {
     setLoading(false);
   };
 
-  useEffect(() => { load(); return () => { if (pollRef.current) clearInterval(pollRef.current); }; }, []);
+  useEffect(() => {
+    load();
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, []);
 
   useEffect(() => {
     const hasProvisioning = vms.some((v) => v.status === "provisioning");
@@ -115,6 +148,10 @@ export default function VMsPage() {
     setSelectedImage(null);
     setSelectedNode(null);
     setVmName(generateVmName());
+    setCpuCores(2);
+    setMemoryMb(2048);
+    setDiskGb(20);
+    setCloudInitUser("ubuntu");
     setModalOpen(true);
     loadImages();
   };
@@ -128,13 +165,14 @@ export default function VMsPage() {
     if (!selectedImage || !selectedNode || !vmName) return;
     setProvisioning(true);
     try {
-      // Find or create a template for this image on the fly using the image's storage path
-      const osImage = `local:iso/${selectedImage.filename}`;
       const res = await post("vms/provision", {
         image_id: selectedImage.id,
         node_name: selectedNode,
         vm_name: vmName,
-        os_image: osImage,
+        cpu_cores: cpuCores,
+        memory_mb: memoryMb,
+        disk_gb: diskGb,
+        cloud_init_user: cloudInitUser,
       });
       setNotification({ message: res.message || "VM provisioning started", statusCode: res.status });
       if (res.status === 200) { setModalOpen(false); load(); }
@@ -155,6 +193,17 @@ export default function VMsPage() {
     }
   };
 
+  const handleCopySSHKey = async (vmId: number) => {
+    try {
+      const res = await get(`vms/${vmId}/ssh-key`);
+      const key: SSHKey = res.data;
+      await navigator.clipboard.writeText(key.public_key);
+      setNotification({ message: "Public key copied to clipboard", statusCode: 200 });
+    } catch (err: any) {
+      setNotification({ message: err.message || "Failed to copy SSH key", statusCode: 500 });
+    }
+  };
+
   const onlineNodes = nodes.filter((n) => n.status === "online");
 
   return (
@@ -162,7 +211,9 @@ export default function VMsPage() {
       <Group justify="space-between">
         <Box>
           <Title order={3} mb={4} style={{ color: "var(--lnr-text)" }}>Virtual Machines</Title>
-          <Text size="sm" style={{ color: "var(--lnr-text-muted)" }}>Manage Proxmox QEMU virtual machines</Text>
+          <Text size="sm" style={{ color: "var(--lnr-text-muted)" }}>
+            Manage Proxmox QEMU virtual machines — provisioned via Terraform with cloud-init
+          </Text>
         </Box>
         <Button leftSection={<IconPlus size={14} />} size="sm" onClick={openModal}>
           Provision VM
@@ -218,14 +269,41 @@ export default function VMsPage() {
                     <Badge color={statusColor(vm.status)} variant="light" size="xs">{vm.status}</Badge>
                   </Table.Td>
                   <Table.Td>
-                    <Button
-                      size="xs" variant="subtle" color="red"
-                      leftSection={<IconTrash size={12} />}
-                      onClick={() => handleDelete(vm.id)}
-                      disabled={vm.status === "provisioning"}
-                    >
-                      Remove
-                    </Button>
+                    <Group gap={4} wrap="nowrap">
+                      {vm.status === "running" && (
+                        <>
+                          <Button
+                            size="xs"
+                            variant="subtle"
+                            color="blue"
+                            leftSection={<IconTerminal size={12} />}
+                            component={Link}
+                            href={`/ui/vms/${vm.id}/terminal`}
+                          >
+                            Terminal
+                          </Button>
+                          <Button
+                            size="xs"
+                            variant="subtle"
+                            color="teal"
+                            leftSection={<IconKey size={12} />}
+                            onClick={() => handleCopySSHKey(vm.id)}
+                          >
+                            SSH Key
+                          </Button>
+                        </>
+                      )}
+                      <Button
+                        size="xs"
+                        variant="subtle"
+                        color="red"
+                        leftSection={<IconTrash size={12} />}
+                        onClick={() => handleDelete(vm.id)}
+                        disabled={vm.status === "provisioning"}
+                      >
+                        Remove
+                      </Button>
+                    </Group>
                   </Table.Td>
                 </Table.Tr>
               ))}
@@ -241,8 +319,7 @@ export default function VMsPage() {
         title="Provision Virtual Machine"
         size="lg"
       >
-        <Stack gap="lg">
-          {/* Node selection first so we can check availability */}
+        <Stack gap="md">
           <Select
             label="Target Node"
             placeholder="Select a cluster node"
@@ -252,10 +329,10 @@ export default function VMsPage() {
             onChange={handleNodeChange}
           />
 
-          {/* Image picker */}
+          {/* Image picker — cloud-images only */}
           <Box>
             <Text size="sm" fw={500} mb="xs" style={{ color: "var(--lnr-text)" }}>
-              Choose image
+              Choose cloud image
             </Text>
             {imagesLoading ? (
               <Skeleton height={80} radius="sm" />
@@ -266,7 +343,17 @@ export default function VMsPage() {
                   return (
                     <UnstyledButton
                       key={img.id}
-                      onClick={() => setSelectedImage(img)}
+                      onClick={() => {
+                        setSelectedImage(img);
+                        // Set default cloud-init user based on OS family
+                        const defaultUser =
+                          img.os_family === "ubuntu" ? "ubuntu"
+                          : img.os_family === "debian" ? "debian"
+                          : img.os_family === "rhel" ? "cloud-user"
+                          : img.os_family === "alpine" ? "alpine"
+                          : "ubuntu";
+                        setCloudInitUser(defaultUser);
+                      }}
                       style={{
                         border: `1px solid ${selected ? "var(--mantine-color-blue-6)" : "var(--lnr-border)"}`,
                         borderRadius: 6,
@@ -281,9 +368,14 @@ export default function VMsPage() {
                           <Box>
                             <Group gap="xs" align="center">
                               <Text size="sm" fw={600}>{img.name}</Text>
+                              <Tooltip label="Cloud image — boots with DHCP, SSH key injected via cloud-init">
+                                <Badge size="xs" color="blue" variant="light" leftSection={<IconCloud size={10} />}>
+                                  Cloud
+                                </Badge>
+                              </Tooltip>
                               {selectedNode && (
                                 img.available ? (
-                                  <Tooltip label="ISO already on host">
+                                  <Tooltip label="Image already on host">
                                     <Badge
                                       size="xs"
                                       color="green"
@@ -316,7 +408,7 @@ export default function VMsPage() {
                   );
                 })}
                 {images.length === 0 && (
-                  <Text size="sm" c="dimmed">No images available.</Text>
+                  <Text size="sm" c="dimmed">No cloud images available.</Text>
                 )}
               </Stack>
             )}
@@ -330,6 +422,36 @@ export default function VMsPage() {
             required
           />
 
+          <Group grow>
+            <NumberInput
+              label="CPU Cores"
+              min={1}
+              max={64}
+              value={cpuCores}
+              onChange={(v) => setCpuCores(Number(v))}
+            />
+            <NumberInput
+              label="Memory (MB)"
+              min={512}
+              step={512}
+              value={memoryMb}
+              onChange={(v) => setMemoryMb(Number(v))}
+            />
+            <NumberInput
+              label="Disk (GB)"
+              min={10}
+              value={diskGb}
+              onChange={(v) => setDiskGb(Number(v))}
+            />
+          </Group>
+
+          <TextInput
+            label="Cloud-init user"
+            description="Default login user injected via cloud-init"
+            value={cloudInitUser}
+            onChange={(e) => setCloudInitUser(e.currentTarget.value)}
+          />
+
           {selectedImage && selectedNode && (
             <Box
               style={{
@@ -340,11 +462,16 @@ export default function VMsPage() {
               }}
             >
               <Text size="xs" fw={500} mb={4}>Summary</Text>
-              <Text size="xs" c="dimmed">{selectedImage.name} · {vmName} · {selectedNode}</Text>
               <Text size="xs" c="dimmed">
+                {selectedImage.name} · {vmName} · {selectedNode}
+              </Text>
+              <Text size="xs" c="dimmed">
+                {cpuCores} vCPU · {memoryMb} MB RAM · {diskGb} GB disk · user: {cloudInitUser}
+              </Text>
+              <Text size="xs" c="dimmed" mt={4}>
                 {selectedImage.available
-                  ? "ISO already on host — provisioning will start immediately"
-                  : `ISO will be downloaded first (~${selectedImage.size_gb} GB)`}
+                  ? "Image already on host — Terraform will provision immediately"
+                  : `Image will be downloaded first (~${selectedImage.size_gb} GB)`}
               </Text>
             </Box>
           )}

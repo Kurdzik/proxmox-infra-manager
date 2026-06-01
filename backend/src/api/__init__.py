@@ -4,7 +4,7 @@ from src.api.init import router as init_router
 from src.api.users import router as users_router
 from src.api.nodes import router as nodes_router
 from src.api.vms import router as vms_router
-from src.api.containers import router as containers_router
+from src.api.terminal import router as terminal_router
 from src.api.docker import router as docker_router
 from src.api.plugins import router as plugins_router
 from src.api.images import router as images_router
@@ -23,7 +23,7 @@ public_router.include_router(users_router)
 api_router = APIRouter(prefix="/api/v1", dependencies=[Depends(check_token)])
 api_router.include_router(nodes_router)
 api_router.include_router(vms_router)
-api_router.include_router(containers_router)
+api_router.include_router(terminal_router)
 api_router.include_router(docker_router)
 api_router.include_router(plugins_router)
 api_router.include_router(images_router)

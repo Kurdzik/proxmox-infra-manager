@@ -72,6 +72,10 @@ class BaseProxmoxAdapter:
         """Execute a command inside a QEMU VM via the QEMU guest agent."""
         self._not_implemented()
 
+    def get_vm_ip(self, node: str, vmid: int) -> Optional[str]:
+        """Return the first non-loopback IPv4 address reported by the QEMU guest agent, or None."""
+        self._not_implemented()
+
     # ------------------------------------------------------------------
     # LXC Containers
     # ------------------------------------------------------------------
@@ -93,6 +97,10 @@ class BaseProxmoxAdapter:
 
     def exec_ct(self, node: str, vmid: int, command: list[str]) -> dict:
         """Execute a command inside an LXC container."""
+        self._not_implemented()
+
+    def get_ct_ip(self, node: str, vmid: int) -> Optional[str]:
+        """Return the first non-loopback IPv4 address from LXC interfaces, or None."""
         self._not_implemented()
 
     # ------------------------------------------------------------------
@@ -157,8 +165,21 @@ class BaseProxmoxAdapter:
         self._not_implemented()
 
     # ------------------------------------------------------------------
+    # VM config update
+    # ------------------------------------------------------------------
+
+    def update_vm_config(self, node: str, vmid: int, config: dict) -> dict:
+        self._not_implemented()
+
+    def resize_disk(self, node: str, vmid: int, disk: str, size: str) -> dict:
+        self._not_implemented()
+
+    # ------------------------------------------------------------------
     # Storage / ISO management
     # ------------------------------------------------------------------
+
+    def get_storage_info(self, storage_id: str) -> dict:
+        self._not_implemented()
 
     def list_storage_content(self, node: str, storage: str, content_type: str = "iso") -> list[dict]:
         """List files in a storage volume. Returns list of dicts with 'volid', 'size', etc."""

@@ -19,13 +19,12 @@ import {
 } from "@mantine/core";
 import { IconPlus, IconTrash, IconBrandDocker } from "@tabler/icons-react";
 import { get, post, del } from "@/lib/backendRequests";
-import type { DockerService, VM, Container, AllowedImage } from "@/lib/types";
+import type { DockerService, VM, AllowedImage } from "@/lib/types";
 import { DisplayNotification } from "@/components/Notifications/component";
 
 export default function DockerPage() {
   const [services, setServices] = useState<DockerService[]>([]);
   const [vms, setVMs] = useState<VM[]>([]);
-  const [containers, setContainers] = useState<Container[]>([]);
   const [images, setImages] = useState<AllowedImage[]>([]);
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
@@ -42,15 +41,13 @@ export default function DockerPage() {
   const pollRef = useRef<NodeJS.Timeout | null>(null);
 
   const load = async () => {
-    const [svcRes, vmRes, ctRes, imgRes] = await Promise.allSettled([
+    const [svcRes, vmRes, imgRes] = await Promise.allSettled([
       get("docker/list"),
       get("vms/list"),
-      get("containers/list"),
       get("images/list"),
     ]);
     if (svcRes.status === "fulfilled") setServices(svcRes.value.data?.services || []);
     if (vmRes.status === "fulfilled") setVMs(vmRes.value.data?.vms || []);
-    if (ctRes.status === "fulfilled") setContainers(ctRes.value.data?.containers || []);
     if (imgRes.status === "fulfilled") setImages(imgRes.value.data?.images || []);
     setLoading(false);
   };
@@ -106,18 +103,11 @@ export default function DockerPage() {
   const statusColor = (s: string) =>
     s === "running" ? "green" : s === "stopped" ? "gray" : s === "deploying" ? "blue" : "red";
 
-  const targetOptions = [
-    ...vms.filter((v) => v.status === "running").map((v) => ({
-      value: `vm:${v.vmid}`,
-      label: `[VM] ${v.name} (${v.vmid}) — ${v.node_name}`,
-      group: "Virtual Machines",
-    })),
-    ...containers.filter((c) => c.status === "running").map((c) => ({
-      value: `ct:${c.vmid}`,
-      label: `[CT] ${c.name} (${c.vmid}) — ${c.node_name}`,
-      group: "LXC Containers",
-    })),
-  ];
+  const targetOptions = vms.filter((v) => v.status === "running").map((v) => ({
+    value: `vm:${v.vmid}`,
+    label: `[VM] ${v.name} (${v.vmid}) — ${v.node_name}`,
+    group: "Virtual Machines",
+  }));
 
   const imageOptions = images.map((img) => ({ value: img.name, label: img.name }));
 

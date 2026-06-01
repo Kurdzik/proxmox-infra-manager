@@ -5,7 +5,6 @@ import {
   IconLayoutDashboard,
   IconServer,
   IconDeviceDesktop,
-  IconBox,
   IconBrandDocker,
   IconNetwork,
   IconShield,
@@ -16,6 +15,7 @@ import {
   IconChevronLeft,
   IconChevronRight,
   IconServerBolt,
+  IconSettings,
 } from "@tabler/icons-react";
 import React from "react";
 import Link from "next/link";
@@ -33,7 +33,6 @@ const infrastructureItems: NavItem[] = [
   { icon: <IconLayoutDashboard size={16} stroke={1.5} />, label: "Dashboard", route: "/ui/dashboard" },
   { icon: <IconServer size={16} stroke={1.5} />, label: "Nodes", route: "/ui/nodes" },
   { icon: <IconDeviceDesktop size={16} stroke={1.5} />, label: "Virtual Machines", route: "/ui/vms" },
-  { icon: <IconBox size={16} stroke={1.5} />, label: "Containers", route: "/ui/containers" },
 ];
 
 const servicesItems: NavItem[] = [
@@ -46,6 +45,7 @@ const servicesItems: NavItem[] = [
 const platformItems: NavItem[] = [
   { icon: <IconPuzzle size={16} stroke={1.5} />, label: "Plugins", route: "/ui/plugins" },
   { icon: <IconPhoto size={16} stroke={1.5} />, label: "Image Allowlist", route: "/ui/images" },
+  { icon: <IconSettings size={16} stroke={1.5} />, label: "Settings", route: "/ui/settings" },
 ];
 
 const bottomItems: NavItem[] = [

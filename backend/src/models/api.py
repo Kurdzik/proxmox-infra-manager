@@ -66,29 +66,12 @@ class CreateVMTemplateRequest(BaseModel):
 class ProvisionVMRequest(BaseModel):
     node_name: str
     vm_name: str
-    # Provide either template_id (existing template) OR image_id+os_image (direct from image list)
-    template_id: Optional[int] = None
-    image_id: Optional[str] = None   # e.g. "ubuntu-2404"
-    os_image: Optional[str] = None   # e.g. "local:iso/ubuntu-24.04.1-live-server-amd64.iso"
-
-
-# ---------------------------------------------------------------------------
-# Containers (LXC)
-# ---------------------------------------------------------------------------
-
-class CreateCTTemplateRequest(BaseModel):
-    name: str
-    cores: int
-    memory_mb: int
-    rootfs_gb: int
-    os_template_url: str
-    extra_config: Optional[str] = None
-
-
-class ProvisionCTRequest(BaseModel):
-    template_id: int
-    node_name: str
-    ct_name: str
+    image_id: str               # must be a cloud-image type, e.g. "ubuntu-2404-cloud"
+    cpu_cores: int = 2
+    memory_mb: int = 2048
+    disk_gb: int = 20
+    cloud_init_user: str = "ubuntu"
+    bridge: Optional[str] = None  # defaults to tenant vnet bridge or vmbr0
 
 
 # ---------------------------------------------------------------------------

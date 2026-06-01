@@ -10,18 +10,16 @@ import {
   Group,
   Stack,
   Badge,
-  rem,
   Skeleton,
 } from "@mantine/core";
 import {
   IconServer,
   IconDeviceDesktop,
-  IconBox,
   IconBrandDocker,
   IconPuzzle,
 } from "@tabler/icons-react";
 import { get } from "@/lib/backendRequests";
-import type { Node, VM, Container, DockerService, Plugin } from "@/lib/types";
+import type { Node, VM, DockerService, Plugin } from "@/lib/types";
 
 interface StatCard {
   label: string;
@@ -33,7 +31,6 @@ interface StatCard {
 export default function DashboardPage() {
   const [nodes, setNodes] = useState<Node[]>([]);
   const [vms, setVMs] = useState<VM[]>([]);
-  const [containers, setContainers] = useState<Container[]>([]);
   const [services, setServices] = useState<DockerService[]>([]);
   const [plugins, setPlugins] = useState<Plugin[]>([]);
   const [loading, setLoading] = useState(true);
@@ -41,17 +38,15 @@ export default function DashboardPage() {
   useEffect(() => {
     const load = async () => {
       try {
-        const [nodesRes, vmsRes, ctRes, svcRes, pluginsRes] = await Promise.allSettled([
+        const [nodesRes, vmsRes, svcRes, pluginsRes] = await Promise.allSettled([
           get("nodes/list"),
           get("vms/list"),
-          get("containers/list"),
           get("docker/list"),
           get("plugins/list"),
         ]);
 
         if (nodesRes.status === "fulfilled") setNodes(nodesRes.value.data?.nodes || []);
         if (vmsRes.status === "fulfilled") setVMs(vmsRes.value.data?.vms || []);
-        if (ctRes.status === "fulfilled") setContainers(ctRes.value.data?.containers || []);
         if (svcRes.status === "fulfilled") setServices(svcRes.value.data?.services || []);
         if (pluginsRes.status === "fulfilled") setPlugins(pluginsRes.value.data?.plugins || []);
       } finally {
@@ -75,12 +70,6 @@ export default function DashboardPage() {
       color: "var(--lnr-success)",
     },
     {
-      label: "Containers",
-      value: containers.length,
-      icon: <IconBox size={20} stroke={1.5} />,
-      color: "var(--lnr-warning)",
-    },
-    {
       label: "Docker Services",
       value: services.length,
       icon: <IconBrandDocker size={20} stroke={1.5} />,
@@ -94,12 +83,6 @@ export default function DashboardPage() {
     },
   ];
 
-  const runningNodes = nodes.filter((n) => n.status === "online").length;
-  const runningVMs = vms.filter((v) => v.status === "running").length;
-  const runningContainers = containers.filter((c) => c.status === "running").length;
-  const runningServices = services.filter((s) => s.status === "running").length;
-  const runningPlugins = plugins.filter((p) => p.status === "running").length;
-
   return (
     <Stack gap="xl">
       <Box>
@@ -112,8 +95,8 @@ export default function DashboardPage() {
       </Box>
 
       <Grid>
-        {stats.map((stat, i) => (
-          <Grid.Col key={stat.label} span={{ base: 12, sm: 6, md: 4, lg: 2.4 }}>
+        {stats.map((stat) => (
+          <Grid.Col key={stat.label} span={{ base: 12, sm: 6, md: 3 }}>
             <Paper p="md" style={{ height: "100%" }}>
               {loading ? (
                 <Skeleton height={80} />

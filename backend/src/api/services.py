@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select, and_
 
-from src.models import ApiResponse, DockerService, DNSEntry, NginxConfig, VM, Container, UserInfo
+from src.models import ApiResponse, DockerService, DNSEntry, NginxConfig, VM, UserInfo
 from src.utils import get_db_session, get_user_info
 from src.logger import get_logger
 

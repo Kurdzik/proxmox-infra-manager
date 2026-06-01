@@ -1,0 +1,68 @@
+terraform {
+  required_providers {
+    proxmox = {
+      source  = "bpg/proxmox"
+      version = "~> 0.66"
+    }
+  }
+}
+
+provider "proxmox" {
+  endpoint  = "{{ proxmox_url }}"
+  api_token = "{{ api_token }}"
+  insecure  = {{ insecure | lower }}
+
+  ssh {
+    agent    = false
+    username = "{{ ssh_username }}"
+    password = "{{ ssh_password }}"
+  }
+}
+
+resource "proxmox_virtual_environment_vm" "vm" {
+  name      = "{{ vm_name }}"
+  node_name = "{{ node_name }}"
+  vm_id     = {{ vmid }}
+
+  cpu {
+    cores = {{ cpu_cores }}
+    type  = "x86-64-v2-AES"
+  }
+
+  memory {
+    dedicated = {{ memory_mb }}
+  }
+
+  disk {
+    datastore_id = "local-lvm"
+    file_id      = "local:iso/{{ image_filename }}"
+    interface    = "scsi0"
+    size         = {{ disk_gb }}
+    discard      = "on"
+  }
+
+  network_device {
+    bridge = "{{ bridge }}"
+    model  = "virtio"
+  }
+
+  initialization {
+    ip_config {
+      ipv4 {
+        address = "dhcp"
+      }
+    }
+    user_account {
+      username = "{{ cloud_init_user }}"
+      keys     = [{% for key in ssh_public_keys %}"{{ key }}"{% if not loop.last %}, {% endif %}{% endfor %}]
+    }
+  }
+
+  agent {
+    enabled = true
+  }
+}
+
+output "vm_ipv4" {
+  value = try(proxmox_virtual_environment_vm.vm.ipv4_addresses[1][0], null)
+}

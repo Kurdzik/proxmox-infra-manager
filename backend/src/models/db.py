@@ -53,6 +53,8 @@ class PlatformConfig(SQLModel, table=True):
     token_id: Optional[str] = None          # e.g. root@pam!infra-manager
     encrypted_token_secret: Optional[str] = None
     verify_ssl: bool = Field(default=False)
+    ssh_username: Optional[str] = None     # SSH user for Terraform provider (e.g. root)
+    encrypted_ssh_password: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 
@@ -107,7 +109,12 @@ class VMTemplate(SQLModel, table=True):
     memory_mb: int
     disk_gb: int
     os_image: str           # Proxmox storage path or ISO URL
+    image_type: str = Field(default="iso")  # "iso" or "cloud-image"
     network_model: str = Field(default="virtio")
+    # Cloud-init fields (used when image_type == "cloud-image")
+    cloud_init_user: Optional[str] = None         # default login user, e.g. "ubuntu"
+    cloud_init_ssh_keys: Optional[str] = None     # newline-separated public keys
+    cloud_init_user_data: Optional[str] = None    # Jinja2 YAML template override
     extra_config: Optional[str] = None   # JSON blob for additional Proxmox params
     created_at: datetime = Field(default_factory=datetime.now)
 
@@ -121,45 +128,39 @@ class VM(SQLModel, table=True):
     node_name: str
     name: str
     status: str = Field(default="stopped")  # "running", "stopped", "provisioning", "error"
+    cpu_cores: Optional[int] = None
+    memory_mb: Optional[int] = None
+    disk_gb: Optional[int] = None
     ip_address: Optional[str] = None
+    cloud_init_user: Optional[str] = None
     template_id: Optional[int] = Field(default=None, foreign_key="vm_templates.id")
     task_id: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 
 
-# ---------------------------------------------------------------------------
-# LXC container provisioning
-# ---------------------------------------------------------------------------
-
-class CTTemplate(SQLModel, table=True):
-    __tablename__ = "ct_templates"
+class TerraformWorkspace(SQLModel, table=True):
+    __tablename__ = "terraform_workspaces"
 
     id: Optional[int] = Field(default=None, primary_key=True)
+    vm_id: int = Field(index=True, foreign_key="vms.id")
     tenant_id: str = Field(index=True)
-    name: str
-    cores: int
-    memory_mb: int
-    rootfs_gb: int
-    os_template_url: str    # e.g. "local:vztmpl/ubuntu-22.04-standard_22.04-1_amd64.tar.zst"
-    extra_config: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.now)
-
-
-class Container(SQLModel, table=True):
-    __tablename__ = "containers"
-
-    id: Optional[int] = Field(default=None, primary_key=True)
-    tenant_id: str = Field(index=True)
-    vmid: int = Field(index=True)
-    node_name: str
-    name: str
-    status: str = Field(default="stopped")
-    ip_address: Optional[str] = None
-    template_id: Optional[int] = Field(default=None, foreign_key="ct_templates.id")
-    task_id: Optional[str] = None
+    rendered_config: str
+    terraform_state: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
+
+
+class VMSSHKey(SQLModel, table=True):
+    __tablename__ = "vm_ssh_keys"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    vm_id: int = Field(index=True, foreign_key="vms.id")
+    tenant_id: str = Field(index=True)
+    public_key: str
+    private_key_encrypted: str
+    key_type: str = Field(default="ed25519")
+    created_at: datetime = Field(default_factory=datetime.now)
 
 
 # ---------------------------------------------------------------------------

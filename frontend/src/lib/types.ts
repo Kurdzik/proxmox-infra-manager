@@ -51,33 +51,15 @@ export interface VM {
   memory_mb: number;
   disk_gb: number;
   ip_address?: string;
+  cloud_init_user?: string;
   template_id?: number;
   tenant_id: string;
 }
 
-// ── Containers ────────────────────────────────────────────────────────────────
-
-export interface CTTemplate {
-  id: number;
-  name: string;
-  cpu_cores: number;
-  memory_mb: number;
-  disk_gb: number;
-  os_template: string;
-}
-
-export interface Container {
-  id: number;
-  vmid: number;
-  name: string;
-  node_name: string;
-  status: string;
-  cpu_cores: number;
-  memory_mb: number;
-  disk_gb: number;
-  ip_address?: string;
-  template_id?: number;
-  tenant_id: string;
+export interface SSHKey {
+  vm_id: number;
+  public_key: string;
+  key_type: string;
 }
 
 // ── Docker ────────────────────────────────────────────────────────────────────
@@ -161,6 +143,7 @@ export interface VmImage {
   name: string;
   description: string;
   os_family: string;
+  image_type: "iso" | "cloud-image";
   filename: string;
   url: string;
   size_gb: number;

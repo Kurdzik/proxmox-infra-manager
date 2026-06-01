@@ -1,3 +1,5 @@
+@import "@xterm/xterm/css/xterm.css";
+
 /* ─── Always-present tokens ───────────────────────────────────────── */
 :root {
   --lnr-accent: #5e6ad2;

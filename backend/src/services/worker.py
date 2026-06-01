@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -14,8 +15,6 @@ from src import configure_logger, get_logger, tenant_context
 from src.crypto import decrypt_str, encrypt_str
 from src.models import (
     AllowedImage,
-    Container,
-    CTTemplate,
     DNSEntry,
     DockerService,
     FirewallRule,
@@ -26,12 +25,16 @@ from src.models import (
     ProxmoxNode,
     TenantLogSettings,
     TenantVNet,
+    TerraformWorkspace,
     VM,
+    VMSSHKey,
     VMTemplate,
 )
 from src.nginx_manager import NginxConfigManager
 from src.plugin_manager import DockerComposeRunner, IntegrationClient, PluginManifest
 from src.proxmox import ProxmoxAdapterFactory, ProxmoxCredentials
+from src.services.ssh_service import generate_ed25519_keypair
+from src.terraform import TerraformManager
 
 app = Celery("infra-manager-worker")
 app.conf.update(
@@ -100,8 +103,6 @@ def sync_cluster_state(self):
         for node_data in nodes:
             node_name = node_data.get("node")
 
-            # list_nodes() often omits hardware details in cluster mode;
-            # fall back to per-node status for memory, cpu_count, uptime.
             status_data = {}
             try:
                 status_data = adapter.get_node_status(node_name)
@@ -145,17 +146,21 @@ def sync_cluster_state(self):
                     vm = db.exec(select(VM).where(VM.vmid == vmid)).first()
                     if vm:
                         vm.status = vm_data.get("status", "stopped")
+                        if vm_data.get("cpus"):
+                            vm.cpu_cores = vm_data["cpus"]
+                        if vm_data.get("maxmem"):
+                            vm.memory_mb = vm_data["maxmem"] // (1024 * 1024)
+                        if vm_data.get("maxdisk"):
+                            vm.disk_gb = vm_data["maxdisk"] // (1024 * 1024 * 1024)
+                        if vm_data.get("status") == "running":
+                            try:
+                                ip = adapter.get_vm_ip(node_name, vmid)
+                                if ip:
+                                    vm.ip_address = ip
+                            except Exception:
+                                pass
                         vm.updated_at = datetime.now()
                         db.add(vm)
-
-                cts = adapter.list_cts(node_name)
-                for ct_data in cts:
-                    vmid = ct_data.get("vmid")
-                    ct = db.exec(select(Container).where(Container.vmid == vmid)).first()
-                    if ct:
-                        ct.status = ct_data.get("status", "stopped")
-                        ct.updated_at = datetime.now()
-                        db.add(ct)
             except Exception as e:
                 logger.warning("node_sync_failed", node=node_name, error=str(e))
 
@@ -163,91 +168,139 @@ def sync_cluster_state(self):
 
 
 # ---------------------------------------------------------------------------
-# VM provisioning
+# VM provisioning (Terraform-based)
 # ---------------------------------------------------------------------------
 
 @app.task(bind=True, max_retries=TASK_MAX_RETRIES, soft_time_limit=1800, time_limit=1860)
-def provision_vm(self, template_id: int, node_name: str, vm_name: str, tenant_id: str):
+def provision_vm(
+    self,
+    vm_id: int,
+    node_name: str,
+    vm_name: str,
+    tenant_id: str,
+    image_id: str,
+    cpu_cores: int,
+    memory_mb: int,
+    disk_gb: int,
+    cloud_init_user: str,
+    bridge: str,
+):
     with tenant_context(tenant_id=tenant_id, service_name="worker.provision_vm"):
         with Session(engine) as db:
             with _tenant_provision_slot(tenant_id) as acquired:
                 if not acquired:
                     raise self.retry(countdown=30)
 
-                template = db.exec(
-                    select(VMTemplate).where(
-                        and_(VMTemplate.tenant_id == tenant_id, VMTemplate.id == template_id)
+                vm = db.exec(select(VM).where(and_(VM.tenant_id == tenant_id, VM.id == vm_id))).first()
+                if not vm:
+                    raise ValueError(f"VM record {vm_id} not found")
+
+                work_dir = f"/tmp/tf_{vm_id}"
+                try:
+                    # 1. Validate image
+                    from src.images import IMAGE_BY_ID
+                    img = IMAGE_BY_ID.get(image_id)
+                    if not img or img.get("image_type") != "cloud-image":
+                        raise ValueError(f"Image '{image_id}' not found or is not a cloud-image type")
+
+                    # 2. Allocate VMID — union of Proxmox + DB to avoid reuse of errored VMs
+                    adapter = _get_adapter(db)
+                    proxmox_vmids = {v.get("vmid") for v in adapter.list_vms(node_name)}
+                    db_vmids = {v.vmid for v in db.exec(select(VM).where(VM.vmid > 0)).all()}
+                    existing_vmids = proxmox_vmids | db_vmids
+                    vmid = max(existing_vmids, default=99) + 1
+                    vm.vmid = vmid
+                    db.add(vm)
+                    db.commit()
+
+                    # 3. Generate SSH keypair
+                    public_key, private_key_pem = generate_ed25519_keypair()
+
+                    # 4. Load platform config for Terraform provider
+                    config = db.exec(select(PlatformConfig)).first()
+                    token_secret = decrypt_str(config.encrypted_token_secret)
+                    api_token = f"{config.token_id}={token_secret}"
+                    if not config.ssh_username or not config.encrypted_ssh_password:
+                        raise ValueError(
+                            "SSH credentials not configured. Go to Settings → SSH Credentials and save Proxmox SSH username/password."
+                        )
+                    ssh_password = decrypt_str(config.encrypted_ssh_password)
+
+                    # 5. Render Terraform template
+                    os.makedirs(work_dir, exist_ok=True)
+                    tf_mgr = TerraformManager(work_dir)
+                    rendered = tf_mgr.render_template("proxmox_vm.tf.j2", {
+                        "proxmox_url": config.proxmox_url,
+                        "api_token": api_token,
+                        "insecure": not config.verify_ssl,
+                        "ssh_username": config.ssh_username,
+                        "ssh_password": ssh_password,
+                        "node_name": node_name,
+                        "vm_name": vm_name,
+                        "vmid": vmid,
+                        "cpu_cores": cpu_cores,
+                        "memory_mb": memory_mb,
+                        "disk_gb": disk_gb,
+                        "image_filename": img["filename"],
+                        "bridge": bridge,
+                        "cloud_init_user": cloud_init_user,
+                        "ssh_public_keys": [public_key],
+                    })
+                    tf_mgr.write_config(rendered)
+
+                    # 6. terraform init + apply
+                    logger.info("terraform_init_started", vmid=vmid, persist_db=True)
+                    tf_mgr.init()
+                    logger.info("terraform_apply_started", vmid=vmid, persist_db=True)
+                    outputs = tf_mgr.apply()
+
+                    # 7. Persist terraform state
+                    state_json = tf_mgr.read_state()
+                    workspace = TerraformWorkspace(
+                        vm_id=vm_id,
+                        tenant_id=tenant_id,
+                        rendered_config=rendered,
+                        terraform_state=state_json,
                     )
-                ).first()
-                if not template:
-                    raise ValueError(f"Template {template_id} not found")
+                    db.add(workspace)
 
-                adapter = _get_adapter(db)
+                    # 8. Persist SSH key (private key encrypted at rest)
+                    ssh_key_record = VMSSHKey(
+                        vm_id=vm_id,
+                        tenant_id=tenant_id,
+                        public_key=public_key,
+                        private_key_encrypted=encrypt_str(private_key_pem),
+                        key_type="ed25519",
+                    )
+                    db.add(ssh_key_record)
 
-                # ── Get-or-download ISO ──────────────────────────────────
-                from src.images import IMAGE_BY_FILENAME, parse_storage_path
-                parsed = parse_storage_path(template.os_image)
-                if parsed:
-                    storage, filename = parsed
-                    try:
-                        content = adapter.list_storage_content(node_name, storage, "iso")
-                        existing = {item.get("volid", "").split("/")[-1] for item in content}
-                        if filename not in existing:
-                            img_meta = IMAGE_BY_FILENAME.get(filename)
-                            if img_meta:
-                                logger.info("iso_download_started", filename=filename, persist_db=True)
-                                upid = adapter.download_iso(node_name, storage, img_meta["url"], filename)
-                                adapter.wait_for_task(node_name, upid, poll_interval=10, timeout=1500)
-                                logger.info("iso_download_complete", filename=filename, persist_db=True)
-                            else:
-                                logger.warning("iso_not_found_no_url", filename=filename)
-                    except Exception as e:
-                        logger.warning("iso_check_failed", error=str(e))
-                # ────────────────────────────────────────────────────────
+                    # 9. Update VM record
+                    ip = outputs.get("vm_ipv4")
+                    if ip:
+                        vm.ip_address = ip
+                    vm.status = "running"
+                    vm.cloud_init_user = cloud_init_user
+                    vm.cpu_cores = cpu_cores
+                    vm.memory_mb = memory_mb
+                    vm.disk_gb = disk_gb
+                    vm.updated_at = datetime.now()
+                    db.add(vm)
+                    db.commit()
 
-                existing_vmids = {v.get("vmid") for v in adapter.list_vms(node_name)}
-                vmid = max(existing_vmids, default=99) + 1
+                    logger.info("vm_provisioned_terraform", vmid=vmid, name=vm_name, persist_db=True)
 
-                config = {
-                    "name": vm_name,
-                    "cores": template.cores,
-                    "memory": template.memory_mb,
-                    "scsihw": "virtio-scsi-single",
-                    "scsi0": f"local-lvm:{template.disk_gb}",
-                    "ide2": template.os_image,
-                    "net0": f"{template.network_model},bridge=vmbr0",
-                    "boot": "order=ide2;scsi0",
-                }
-
-                result = adapter.create_vm(node_name, vmid, config)
-
-                vm = VM(
-                    tenant_id=tenant_id,
-                    vmid=vmid,
-                    node_name=node_name,
-                    name=vm_name,
-                    status="provisioning",
-                    template_id=template_id,
-                )
-                db.add(vm)
-                db.commit()
-
-                vnet = db.exec(select(TenantVNet).where(TenantVNet.tenant_id == tenant_id)).first()
-                if vnet:
-                    try:
-                        adapter.assign_vnet_to_vm(node_name, vmid, vnet.vnet_id)
-                    except Exception as e:
-                        logger.warning("vnet_assignment_failed", vmid=vmid, error=str(e))
-
-                adapter.start_vm(node_name, vmid)
-                vm.status = "running"
-                db.add(vm)
-                db.commit()
-
-                logger.info("vm_provisioned", vmid=vmid, name=vm_name, persist_db=True)
+                except Exception as e:
+                    vm.status = "error"
+                    vm.updated_at = datetime.now()
+                    db.add(vm)
+                    db.commit()
+                    logger.error("vm_provision_failed", vm_id=vm_id, name=vm_name, error=str(e), exc_info=True, persist_db=True)
+                    raise
+                finally:
+                    shutil.rmtree(work_dir, ignore_errors=True)
 
 
-@app.task(bind=True, soft_time_limit=300, time_limit=360)
+@app.task(bind=True, soft_time_limit=600, time_limit=660)
 def destroy_vm(self, vm_id: int, tenant_id: str):
     with tenant_context(tenant_id=tenant_id, service_name="worker.destroy_vm"):
         with Session(engine) as db:
@@ -257,6 +310,7 @@ def destroy_vm(self, vm_id: int, tenant_id: str):
             if not vm:
                 return
 
+            # Teardown associated docker services first
             services = db.exec(
                 select(DockerService).where(
                     and_(DockerService.tenant_id == tenant_id, DockerService.target_vmid == vm.vmid)
@@ -265,105 +319,56 @@ def destroy_vm(self, vm_id: int, tenant_id: str):
             for svc in services:
                 _teardown_docker_service(db, svc)
 
-            adapter = _get_adapter(db)
+            # Load Terraform workspace
+            workspace = db.exec(
+                select(TerraformWorkspace).where(
+                    and_(TerraformWorkspace.tenant_id == tenant_id, TerraformWorkspace.vm_id == vm_id)
+                )
+            ).first()
+
+            work_dir = f"/tmp/tf_destroy_{vm_id}"
             try:
-                adapter.stop_vm(vm.node_name, vm.vmid)
-            except Exception:
-                pass
-            adapter.delete_vm(vm.node_name, vm.vmid)
+                if workspace:
+                    os.makedirs(work_dir, exist_ok=True)
+                    tf_mgr = TerraformManager(work_dir)
+                    tf_mgr.write_config(workspace.rendered_config)
+                    if workspace.terraform_state:
+                        tf_mgr.write_state(workspace.terraform_state)
+                    tf_mgr.init()
+                    tf_mgr.destroy()
+                    db.delete(workspace)
+                else:
+                    # Fallback for VMs without a Terraform workspace (legacy or provisioning error).
+                    # Best-effort: the VM may not exist in Proxmox at all, so ignore errors.
+                    if vm.vmid and vm.vmid > 0:
+                        adapter = _get_adapter(db)
+                        try:
+                            adapter.stop_vm(vm.node_name, vm.vmid)
+                        except Exception:
+                            pass
+                        try:
+                            adapter.delete_vm(vm.node_name, vm.vmid)
+                        except Exception:
+                            pass  # VM never existed in Proxmox (e.g. provisioning failed)
 
-            db.delete(vm)
-            db.commit()
-            logger.info("vm_destroyed", vmid=vm.vmid, persist_db=True)
-
-
-# ---------------------------------------------------------------------------
-# Container provisioning
-# ---------------------------------------------------------------------------
-
-@app.task(bind=True, max_retries=TASK_MAX_RETRIES, soft_time_limit=600, time_limit=660)
-def provision_ct(self, template_id: int, node_name: str, ct_name: str, tenant_id: str):
-    with tenant_context(tenant_id=tenant_id, service_name="worker.provision_ct"):
-        with Session(engine) as db:
-            with _tenant_provision_slot(tenant_id) as acquired:
-                if not acquired:
-                    raise self.retry(countdown=30)
-
-                template = db.exec(
-                    select(CTTemplate).where(
-                        and_(CTTemplate.tenant_id == tenant_id, CTTemplate.id == template_id)
+                # Delete SSH key record
+                ssh_key = db.exec(
+                    select(VMSSHKey).where(
+                        and_(VMSSHKey.tenant_id == tenant_id, VMSSHKey.vm_id == vm_id)
                     )
                 ).first()
-                if not template:
-                    raise ValueError(f"Template {template_id} not found")
+                if ssh_key:
+                    db.delete(ssh_key)
 
-                adapter = _get_adapter(db)
-
-                existing_vmids = {c.get("vmid") for c in adapter.list_cts(node_name)}
-                vmid = max(existing_vmids, default=99) + 1
-
-                vnet = db.exec(select(TenantVNet).where(TenantVNet.tenant_id == tenant_id)).first()
-                bridge = vnet.vnet_id if vnet else "vmbr0"
-
-                config = {
-                    "hostname": ct_name,
-                    "cores": template.cores,
-                    "memory": template.memory_mb,
-                    "rootfs": f"local-lvm:{template.rootfs_gb}",
-                    "ostemplate": template.os_template_url,
-                    "net0": f"name=eth0,bridge={bridge}",
-                    "unprivileged": 1,
-                    "features": "nesting=1",  # required for Docker in LXC
-                }
-
-                adapter.create_ct(node_name, vmid, config)
-
-                ct = Container(
-                    tenant_id=tenant_id,
-                    vmid=vmid,
-                    node_name=node_name,
-                    name=ct_name,
-                    status="provisioning",
-                    template_id=template_id,
-                )
-                db.add(ct)
+                db.delete(vm)
                 db.commit()
+                logger.info("vm_destroyed_terraform", vmid=vm.vmid, persist_db=True)
 
-                adapter.start_ct(node_name, vmid)
-                ct.status = "running"
-                db.add(ct)
-                db.commit()
-
-                logger.info("ct_provisioned", vmid=vmid, name=ct_name, persist_db=True)
-
-
-@app.task(bind=True, soft_time_limit=300, time_limit=360)
-def destroy_ct(self, ct_id: int, tenant_id: str):
-    with tenant_context(tenant_id=tenant_id, service_name="worker.destroy_ct"):
-        with Session(engine) as db:
-            ct = db.exec(
-                select(Container).where(and_(Container.tenant_id == tenant_id, Container.id == ct_id))
-            ).first()
-            if not ct:
-                return
-
-            services = db.exec(
-                select(DockerService).where(
-                    and_(DockerService.tenant_id == tenant_id, DockerService.target_vmid == ct.vmid)
-                )
-            ).all()
-            for svc in services:
-                _teardown_docker_service(db, svc)
-
-            adapter = _get_adapter(db)
-            try:
-                adapter.stop_ct(ct.node_name, ct.vmid)
-            except Exception:
-                pass
-            adapter.delete_ct(ct.node_name, ct.vmid)
-
-            db.delete(ct)
-            db.commit()
+            except Exception as e:
+                logger.error("vm_destroy_failed", vm_id=vm_id, error=str(e), exc_info=True, persist_db=True)
+                raise
+            finally:
+                shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -439,7 +444,6 @@ def deploy_docker_service(
                 db.flush()
 
                 if dns_hostname:
-                    config = db.exec(select(PlatformConfig)).first()
                     try:
                         dns_entry = DNSEntry(
                             tenant_id=tenant_id,
@@ -497,7 +501,6 @@ def deploy_docker_service(
                 logger.info("docker_service_deployed", service=service_name, container_id=container_id, persist_db=True)
 
             except Exception as e:
-                # Rollback: stop container if started
                 if container_id:
                     try:
                         rm_cmd = ["docker", "rm", "-f", container_id]
@@ -712,11 +715,9 @@ def install_plugin(self, repo_url: str, auth_token: Optional[str], env_overrides
 
             runner.up(plugin_dir, manifest.compose_file)
 
-            # Determine base URL from first container's network alias
             base_url = f"http://{plugin_name}-backend:8000"
             plugin_record.base_url = base_url
 
-            # Poll health endpoint
             integration = IntegrationClient(db)
             for _ in range(30):
                 plugin_record.base_url = base_url

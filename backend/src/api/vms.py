@@ -1,13 +1,20 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlmodel import Session, select, and_
+from sqlmodel import Session, and_, select
 
-from src.images import COMMON_IMAGES, parse_storage_path
+from src.images import COMMON_IMAGES, IMAGE_BY_ID
 from src.models import (
-    ApiResponse, VM, VMTemplate, UserInfo, PlatformConfig,
-    CreateVMTemplateRequest, ProvisionVMRequest,
+    ApiResponse,
+    CreateVMTemplateRequest,
+    PlatformConfig,
+    ProvisionVMRequest,
+    TenantVNet,
+    UserInfo,
+    VM,
+    VMSSHKey,
+    VMTemplate,
 )
-from src.utils import get_db_session, get_user_info
 from src.logger import get_logger, tenant_context
+from src.utils import get_db_session, get_user_info
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/vms", tags=["VM Provisioning"])
@@ -30,7 +37,7 @@ def list_images(
     db_session: Session = Depends(get_db_session),
     user_info: UserInfo = Depends(get_user_info),
 ):
-    """Return the curated image list annotated with availability on the given node/storage."""
+    """Return the curated cloud-image list annotated with availability on the given node/storage."""
     existing_filenames: set[str] = set()
 
     if node:
@@ -52,16 +59,38 @@ def list_images(
                     fname = volid.split("/")[-1] if "/" in volid else volid
                     existing_filenames.add(fname)
         except Exception:
-            pass  # Storage check is best-effort; still return the list
+            pass  # Storage check is best-effort
 
+    # Only expose cloud-image type images — provisioning now requires cloud-init
     images = []
     for img in COMMON_IMAGES:
-        images.append({
-            **img,
-            "available": img["filename"] in existing_filenames,
-        })
+        if img.get("image_type") == "cloud-image":
+            images.append({
+                **img,
+                "available": img["filename"] in existing_filenames,
+            })
 
     return ApiResponse(message="Images retrieved", data={"images": images, "storage": storage})
+
+
+@router.get("/{vm_id}/ssh-key", response_model=ApiResponse)
+def get_vm_ssh_key(
+    vm_id: int,
+    db_session: Session = Depends(get_db_session),
+    user_info: UserInfo = Depends(get_user_info),
+):
+    with tenant_context(tenant_id=user_info.tenant_id, service_name="api.vms"):
+        ssh_key = db_session.exec(
+            select(VMSSHKey).where(
+                and_(VMSSHKey.tenant_id == user_info.tenant_id, VMSSHKey.vm_id == vm_id)
+            )
+        ).first()
+        if not ssh_key:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="SSH key not found for this VM")
+        return ApiResponse(
+            message="SSH key retrieved",
+            data={"vm_id": vm_id, "public_key": ssh_key.public_key, "key_type": ssh_key.key_type},
+        )
 
 
 @router.get("/{vm_id}", response_model=ApiResponse)
@@ -86,49 +115,64 @@ def provision_vm(
     user_info: UserInfo = Depends(get_user_info),
 ):
     with tenant_context(tenant_id=user_info.tenant_id, service_name="api.vms"):
-        # Resolve template: use existing template_id, or auto-create one from image_id
-        if request.template_id:
-            template = db_session.exec(
-                select(VMTemplate).where(
-                    and_(VMTemplate.tenant_id == user_info.tenant_id, VMTemplate.id == request.template_id)
-                )
-            ).first()
-            if not template:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found")
-            template_id = request.template_id
-        elif request.image_id and request.os_image:
-            from src.images import IMAGE_BY_ID
-            img = IMAGE_BY_ID.get(request.image_id)
-            if not img:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown image: {request.image_id}")
-            template = VMTemplate(
-                tenant_id=user_info.tenant_id,
-                name=img["name"],
-                cores=2,
-                memory_mb=2048,
-                disk_gb=20,
-                os_image=request.os_image,
-                network_model="virtio",
+        # Validate image exists and is a cloud-image
+        img = IMAGE_BY_ID.get(request.image_id)
+        if not img:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown image: {request.image_id}",
             )
-            db_session.add(template)
-            db_session.commit()
-            db_session.refresh(template)
-            template_id = template.id
-        else:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Provide template_id or image_id+os_image")
+        if img.get("image_type") != "cloud-image":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Only cloud-image type images are supported for provisioning",
+            )
+
+        # Resolve bridge: tenant vnet > request override > default
+        bridge = request.bridge
+        if not bridge:
+            vnet = db_session.exec(
+                select(TenantVNet).where(TenantVNet.tenant_id == user_info.tenant_id)
+            ).first()
+            bridge = vnet.vnet_id if vnet else "vmbr0"
+
+        vm = VM(
+            tenant_id=user_info.tenant_id,
+            vmid=0,  # placeholder; worker assigns the real Proxmox VMID
+            node_name=request.node_name,
+            name=request.vm_name,
+            status="provisioning",
+            cpu_cores=request.cpu_cores,
+            memory_mb=request.memory_mb,
+            disk_gb=request.disk_gb,
+            cloud_init_user=request.cloud_init_user,
+        )
+        db_session.add(vm)
+        db_session.commit()
+        db_session.refresh(vm)
 
         from src.services.worker import provision_vm as provision_vm_task
         task = provision_vm_task.apply_async(
             kwargs={
-                "template_id": template_id,
+                "vm_id": vm.id,
                 "node_name": request.node_name,
                 "vm_name": request.vm_name,
                 "tenant_id": user_info.tenant_id,
+                "image_id": request.image_id,
+                "cpu_cores": request.cpu_cores,
+                "memory_mb": request.memory_mb,
+                "disk_gb": request.disk_gb,
+                "cloud_init_user": request.cloud_init_user,
+                "bridge": bridge,
             },
             ignore_result=True,
         )
 
-        return ApiResponse(message="VM provisioning queued", data={"task_id": task.id})
+        vm.task_id = task.id
+        db_session.add(vm)
+        db_session.commit()
+
+        return ApiResponse(message="VM provisioning queued", data={"task_id": task.id, "vm_id": vm.id})
 
 
 @router.delete("/{vm_id}", response_model=ApiResponse)
@@ -153,22 +197,24 @@ def destroy_vm(
         return ApiResponse(message="VM destruction queued")
 
 
-# VM Templates
+# VM Templates (retained for user-defined configurations)
 DEFAULT_TEMPLATES = [
     {
-        "name": "Ubuntu 24.04 LTS",
+        "name": "Ubuntu 24.04 LTS Cloud",
         "cores": 2,
         "memory_mb": 2048,
         "disk_gb": 20,
-        "os_image": "local:iso/ubuntu-24.04-live-server-amd64.iso",
+        "os_image": "local:iso/ubuntu-24.04-server-cloudimg-amd64.img",
+        "image_type": "cloud-image",
         "network_model": "virtio",
     },
     {
-        "name": "Ubuntu 22.04 LTS",
+        "name": "Ubuntu 22.04 LTS Cloud",
         "cores": 2,
         "memory_mb": 2048,
         "disk_gb": 20,
-        "os_image": "local:iso/ubuntu-22.04.4-live-server-amd64.iso",
+        "os_image": "local:iso/ubuntu-22.04-server-cloudimg-amd64.img",
+        "image_type": "cloud-image",
         "network_model": "virtio",
     },
 ]
@@ -183,7 +229,6 @@ def list_templates(
         select(VMTemplate).where(VMTemplate.tenant_id == user_info.tenant_id)
     ).all()
 
-    # Auto-seed defaults on first use
     if not templates:
         for t in DEFAULT_TEMPLATES:
             tpl = VMTemplate(tenant_id=user_info.tenant_id, **t)
