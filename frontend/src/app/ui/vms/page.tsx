@@ -6,10 +6,13 @@ import {
   Box,
   Button,
   Group,
+  Loader,
   Modal,
   MultiSelect,
   NumberInput,
   Paper,
+  PasswordInput,
+  SegmentedControl,
   Select,
   Skeleton,
   Stack,
@@ -27,15 +30,13 @@ import {
   IconCloud,
   IconDeviceDesktop,
   IconDownload,
-  IconEdit,
-  IconKey,
   IconPlus,
   IconTerminal,
   IconTrash,
 } from "@tabler/icons-react";
 import Link from "next/link";
-import { del, get, patch, post } from "@/lib/backendRequests";
-import type { Node, SSHKey, UserSSHKey, VM, VmImage, VNet } from "@/lib/types";
+import { del, get, post } from "@/lib/backendRequests";
+import type { Node, UserSSHKey, VM, VmImage, VNet } from "@/lib/types";
 import { DisplayNotification } from "@/components/Notifications/component";
 
 function OsIcon({ family, size = 32 }: { family: string; size?: number }) {
@@ -87,6 +88,13 @@ function generateVmName() {
   return `vm-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
 }
 
+function generatePassword(length = 16): string {
+  const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  return Array.from(crypto.getRandomValues(new Uint8Array(length)))
+    .map((b) => chars[b % chars.length])
+    .join("");
+}
+
 const statusColor = (s: string) =>
   s === "running" ? "green" : s === "stopped" ? "gray" : s === "provisioning" ? "blue" : "red";
 
@@ -98,6 +106,7 @@ export default function VMsPage() {
   const [modalOpen, setModalOpen] = useState(false);
   const [provisioning, setProvisioning] = useState(false);
   const [notification, setNotification] = useState<{ message: string; statusCode: number } | null>(null);
+  const [deleteConfirmVm, setDeleteConfirmVm] = useState<VM | null>(null);
 
   const [selectedImage, setSelectedImage] = useState<VmImage | null>(null);
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
@@ -111,8 +120,8 @@ export default function VMsPage() {
   const [selectedSshKeyIds, setSelectedSshKeyIds] = useState<string[]>([]);
   const [networks, setNetworks] = useState<VNet[]>([]);
   const [selectedNetworkId, setSelectedNetworkId] = useState<string | null>(null);
-  const [editIpVm, setEditIpVm] = useState<VM | null>(null);
-  const [editIpValue, setEditIpValue] = useState("");
+  const [authType, setAuthType] = useState<"ssh_key" | "password">("ssh_key");
+  const [consolePassword, setConsolePassword] = useState("");
 
   const pollRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -162,6 +171,8 @@ export default function VMsPage() {
     setCloudInitUser("ubuntu");
     setSelectedSshKeyIds([]);
     setSelectedNetworkId(null);
+    setAuthType("ssh_key");
+    setConsolePassword(generatePassword());
     setModalOpen(true);
     loadImages();
     const [keysRes, netsRes] = await Promise.allSettled([
@@ -190,7 +201,7 @@ export default function VMsPage() {
     if (!selectedImage || !selectedNode || !vmName) return;
     setProvisioning(true);
     try {
-      const res = await post("vms/provision", {
+      const body: Record<string, unknown> = {
         image_id: selectedImage.id,
         node_name: selectedNode,
         vm_name: vmName,
@@ -199,8 +210,13 @@ export default function VMsPage() {
         disk_gb: diskGb,
         cloud_init_user: cloudInitUser,
         network_id: selectedNetworkId ? Number(selectedNetworkId) : undefined,
-        user_ssh_key_ids: selectedSshKeyIds.map(Number),
-      });
+        auth_type: authType,
+        user_ssh_key_ids: authType === "ssh_key" ? selectedSshKeyIds.map(Number) : [],
+      };
+      if (authType === "password") {
+        body.user_password = consolePassword;
+      }
+      const res = await post("vms/provision", body);
       setNotification({ message: res.message || "VM provisioning started", statusCode: res.status });
       if (res.status === 200) { setModalOpen(false); load(); }
     } catch (err: any) {
@@ -211,43 +227,13 @@ export default function VMsPage() {
   };
 
   const handleDelete = async (vmId: number) => {
+    setDeleteConfirmVm(null);
     try {
       const res = await del(`vms/${vmId}`);
       setNotification({ message: res.message || "VM removal started", statusCode: res.status });
       if (res.status === 200) load();
     } catch (err: any) {
       setNotification({ message: err.message, statusCode: 500 });
-    }
-  };
-
-  const handleCopySSHKey = async (vmId: number) => {
-    try {
-      const res = await get(`vms/${vmId}/ssh-key`);
-      if (res.status !== 200 || !res.data) {
-        setNotification({ message: res.detail || "SSH key not found", statusCode: res.status ?? 404 });
-        return;
-      }
-      const key: SSHKey = res.data;
-      await navigator.clipboard.writeText(key.public_key);
-      setNotification({ message: "Public key copied to clipboard", statusCode: 200 });
-    } catch (err: any) {
-      setNotification({ message: err.message || "Failed to copy SSH key", statusCode: 500 });
-    }
-  };
-
-  const handleSetIp = async () => {
-    if (!editIpVm || !editIpValue.trim()) return;
-    try {
-      const res = await patch(`vms/${editIpVm.id}/ip`, { ip_address: editIpValue.trim() });
-      if (res.status === 200) {
-        setNotification({ message: "IP address updated", statusCode: 200 });
-        setEditIpVm(null);
-        load();
-      } else {
-        setNotification({ message: res.detail || "Failed to update IP", statusCode: res.status ?? 500 });
-      }
-    } catch (err: any) {
-      setNotification({ message: err.message || "Failed to update IP", statusCode: 500 });
     }
   };
 
@@ -312,54 +298,37 @@ export default function VMsPage() {
                     </Text>
                   </Table.Td>
                   <Table.Td>
-                    <Group gap={4} wrap="nowrap">
-                      <Text size="sm" c={vm.ip_address ? undefined : "dimmed"}>{vm.ip_address || "—"}</Text>
-                      {vm.status === "running" && (
-                        <Tooltip label="Set IP address" withArrow position="top">
-                          <UnstyledButton
-                            onClick={() => { setEditIpVm(vm); setEditIpValue(vm.ip_address || ""); }}
-                            style={{ display: "flex", alignItems: "center", opacity: 0.5 }}
-                          >
-                            <IconEdit size={12} />
-                          </UnstyledButton>
-                        </Tooltip>
-                      )}
-                    </Group>
+                    <Text size="sm" c={vm.ip_address ? undefined : "dimmed"}>{vm.ip_address || "—"}</Text>
                   </Table.Td>
                   <Table.Td>
-                    <Badge color={statusColor(vm.status)} variant="light" size="xs">{vm.status}</Badge>
+                    {vm.status === "provisioning" ? (
+                      <Tooltip label="Provisioning…" withArrow>
+                        <Loader size="xs" />
+                      </Tooltip>
+                    ) : (
+                      <Badge color={statusColor(vm.status)} variant="light" size="xs">{vm.status}</Badge>
+                    )}
                   </Table.Td>
                   <Table.Td>
                     <Group gap={4} wrap="nowrap">
                       {vm.status === "running" && (
-                        <>
-                          <Button
-                            size="xs"
-                            variant="subtle"
-                            color="blue"
-                            leftSection={<IconTerminal size={12} />}
-                            component={Link}
-                            href={`/ui/vms/${vm.id}/terminal`}
-                          >
-                            Terminal
-                          </Button>
-                          <Button
-                            size="xs"
-                            variant="subtle"
-                            color="teal"
-                            leftSection={<IconKey size={12} />}
-                            onClick={() => handleCopySSHKey(vm.id)}
-                          >
-                            SSH Key
-                          </Button>
-                        </>
+                        <Button
+                          size="xs"
+                          variant="subtle"
+                          color="blue"
+                          leftSection={<IconTerminal size={12} />}
+                          component={Link}
+                          href={`/ui/vms/${vm.id}/terminal`}
+                        >
+                          Terminal
+                        </Button>
                       )}
                       <Button
                         size="xs"
                         variant="subtle"
                         color="red"
                         leftSection={<IconTrash size={12} />}
-                        onClick={() => handleDelete(vm.id)}
+                        onClick={() => setDeleteConfirmVm(vm)}
                         disabled={vm.status === "provisioning"}
                       >
                         Remove
@@ -373,27 +342,23 @@ export default function VMsPage() {
         )}
       </Paper>
 
-      {/* Edit IP modal */}
+      {/* Delete confirmation modal */}
       <Modal
-        opened={!!editIpVm}
-        onClose={() => setEditIpVm(null)}
-        title={`Set IP — ${editIpVm?.name || ""}`}
+        opened={!!deleteConfirmVm}
+        onClose={() => setDeleteConfirmVm(null)}
+        title="Confirm deletion"
         size="sm"
       >
         <Stack gap="md">
-          <Text size="sm" c="dimmed">
-            Enter the IP address assigned to this VM. You can find it in the Proxmox console or via DHCP leases.
+          <Text size="sm">
+            Are you sure you want to destroy <strong>{deleteConfirmVm?.name}</strong>? This will run
+            <code> terraform destroy</code> and permanently delete the VM and all its data.
           </Text>
-          <TextInput
-            label="IP Address"
-            placeholder="10.100.1.100"
-            value={editIpValue}
-            onChange={(e) => setEditIpValue(e.currentTarget.value)}
-            onKeyDown={(e) => e.key === "Enter" && handleSetIp()}
-          />
           <Group justify="flex-end">
-            <Button variant="subtle" onClick={() => setEditIpVm(null)}>Cancel</Button>
-            <Button onClick={handleSetIp} disabled={!editIpValue.trim()}>Save</Button>
+            <Button variant="subtle" onClick={() => setDeleteConfirmVm(null)}>Cancel</Button>
+            <Button color="red" onClick={() => deleteConfirmVm && handleDelete(deleteConfirmVm.id)}>
+              Delete
+            </Button>
           </Group>
         </Stack>
       </Modal>
@@ -431,7 +396,6 @@ export default function VMsPage() {
                       key={img.id}
                       onClick={() => {
                         setSelectedImage(img);
-                        // Set default cloud-init user based on OS family
                         const defaultUser =
                           img.os_family === "ubuntu" ? "ubuntu"
                           : img.os_family === "debian" ? "debian"
@@ -551,16 +515,49 @@ export default function VMsPage() {
             clearable={false}
           />
 
-          <MultiSelect
-            label="Additional SSH Keys"
-            description="Optional — per-VM key is always generated. Select user keys to also inject."
-            placeholder={userSshKeys.length === 0 ? "No keys configured — add them in Account settings" : "Select keys to inject"}
-            data={userSshKeys.map((k) => ({ value: String(k.id), label: k.name }))}
-            value={selectedSshKeyIds}
-            onChange={setSelectedSshKeyIds}
-            clearable
-            disabled={userSshKeys.length === 0}
-          />
+          <Box>
+            <Text size="sm" fw={500} mb={4}>Authentication</Text>
+            <SegmentedControl
+              fullWidth
+              value={authType}
+              onChange={(v) => setAuthType(v as "ssh_key" | "password")}
+              data={[
+                { value: "ssh_key", label: "SSH Keypair" },
+                { value: "password", label: "Username + Password" },
+              ]}
+            />
+          </Box>
+
+          {authType === "ssh_key" ? (
+            <MultiSelect
+              label="Additional SSH Keys"
+              description="Optional — per-VM key is always generated. Select user keys to also inject."
+              placeholder={userSshKeys.length === 0 ? "No keys configured — add them in Account settings" : "Select keys to inject"}
+              data={userSshKeys.map((k) => ({ value: String(k.id), label: k.name }))}
+              value={selectedSshKeyIds}
+              onChange={setSelectedSshKeyIds}
+              clearable
+              disabled={userSshKeys.length === 0}
+            />
+          ) : (
+            <PasswordInput
+              label="Login password"
+              description="This password will be set for the cloud-init user. You can use it to SSH into the VM."
+              value={consolePassword}
+              onChange={(e) => setConsolePassword(e.currentTarget.value)}
+              rightSectionWidth={90}
+              rightSection={
+                <Button
+                  size="xs"
+                  variant="subtle"
+                  onClick={() => setConsolePassword(generatePassword())}
+                  style={{ marginRight: 4 }}
+                >
+                  Regenerate
+                </Button>
+              }
+            />
+          )}
 
           {selectedImage && selectedNode && (
             <Box
@@ -578,6 +575,9 @@ export default function VMsPage() {
               <Text size="xs" c="dimmed">
                 {cpuCores} vCPU · {memoryMb} MB RAM · {diskGb} GB disk · user: {cloudInitUser}
               </Text>
+              <Text size="xs" c="dimmed">
+                Auth: {authType === "ssh_key" ? "SSH keypair" : "username + password"}
+              </Text>
               <Text size="xs" c="dimmed" mt={4}>
                 {selectedImage.available
                   ? "Image already on host — Terraform will provision immediately"
@@ -591,7 +591,7 @@ export default function VMsPage() {
             <Button
               onClick={handleProvision}
               loading={provisioning}
-              disabled={!selectedImage || !selectedNode || !vmName}
+              disabled={!selectedImage || !selectedNode || !vmName || (authType === "password" && !consolePassword)}
             >
               Provision
             </Button>

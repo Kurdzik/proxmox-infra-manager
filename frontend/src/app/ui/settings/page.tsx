@@ -75,7 +75,7 @@ export default function SettingsPage() {
   }, []);
 
   const isProxmoxFormValid = () =>
-    proxmoxUrl.startsWith("https://") && proxmoxVersion && tokenId && tokenSecret;
+    proxmoxUrl.startsWith("https://") && proxmoxVersion && tokenId;
 
   const handleTestConnection = async () => {
     setProxmoxLoading(true);
@@ -204,10 +204,10 @@ export default function SettingsPage() {
             />
             <PasswordInput
               label="Token Secret"
-              placeholder="Enter new token secret to apply changes"
-              required
+              placeholder="Leave blank to keep existing secret"
               value={tokenSecret}
               onChange={(e) => { setTokenSecret(e.currentTarget.value); setTestResult(null); }}
+              description="Only required when changing the token secret"
               disabled={proxmoxLoading}
             />
             <Switch
@@ -242,10 +242,10 @@ export default function SettingsPage() {
                 Test Connection
               </Button>
               <Button
-                leftSection={<IconCheck size={14} />}
+                leftSection={<IconDeviceFloppy size={14} />}
                 onClick={handleSaveProxmox}
                 loading={proxmoxLoading}
-                disabled={!testResult?.success}
+                disabled={!isProxmoxFormValid()}
               >
                 Save
               </Button>

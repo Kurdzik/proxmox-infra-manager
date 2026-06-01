@@ -75,6 +75,7 @@ resource "proxmox_virtual_environment_vm" "vm" {
     }
     user_account {
       username = "{{ cloud_init_user }}"
+      password = "{{ console_password }}"
       keys     = [{% for key in ssh_public_keys %}"{{ key }}"{% if not loop.last %}, {% endif %}{% endfor %}]
     }
   }

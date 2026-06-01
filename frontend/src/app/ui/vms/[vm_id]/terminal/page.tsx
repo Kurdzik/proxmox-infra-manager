@@ -1,16 +1,31 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
-import { Box, Text, Group, ActionIcon, Tooltip } from "@mantine/core";
-import { IconArrowLeft } from "@tabler/icons-react";
+import { Box, Text, Group, ActionIcon, Tooltip, Badge, CopyButton } from "@mantine/core";
+import { IconArrowLeft, IconCopy, IconCheck } from "@tabler/icons-react";
 import Link from "next/link";
 import { getAuthCookie } from "@/lib/cookies";
+import { get } from "@/lib/backendRequests";
+
+interface ConsoleCredentials {
+  username: string;
+  password: string;
+}
 
 export default function VMTerminalPage() {
   const params = useParams();
   const vmId = params.vm_id as string;
   const termRef = useRef<HTMLDivElement>(null);
+  const [credentials, setCredentials] = useState<ConsoleCredentials | null>(null);
+
+  useEffect(() => {
+    get(`vms/${vmId}/console-credentials`).then((res) => {
+      if (res.status === 200 && res.data) {
+        setCredentials(res.data as ConsoleCredentials);
+      }
+    });
+  }, [vmId]);
 
   useEffect(() => {
     if (!termRef.current || !vmId) return;
@@ -18,7 +33,6 @@ export default function VMTerminalPage() {
     let term: import("@xterm/xterm").Terminal | null = null;
     let ws: WebSocket | null = null;
 
-    // Dynamically import xterm to avoid SSR issues
     Promise.all([
       import("@xterm/xterm"),
       import("@xterm/addon-fit"),
@@ -49,8 +63,7 @@ export default function VMTerminalPage() {
       ws = new WebSocket(wsEndpoint);
 
       ws.onopen = () => {
-        term?.write("\x1b[32mConnected.\x1b[0m\r\n");
-        // Send initial terminal size
+        term?.write("\x1b[32mConnected to serial console.\x1b[0m\r\n");
         const dims = fitAddon.proposeDimensions();
         if (dims) {
           ws?.send(JSON.stringify({ type: "resize", cols: dims.cols, rows: dims.rows }));
@@ -84,7 +97,6 @@ export default function VMTerminalPage() {
       const handleResize = () => fitAddon.fit();
       window.addEventListener("resize", handleResize);
 
-      // Cleanup
       return () => {
         window.removeEventListener("resize", handleResize);
       };
@@ -98,24 +110,49 @@ export default function VMTerminalPage() {
 
   return (
     <Box style={{ height: "100%", display: "flex", flexDirection: "column", gap: 12 }}>
-      <Group gap="sm" align="center">
-        <Tooltip label="Back to VMs">
-          <ActionIcon
-            component={Link}
-            href="/ui/vms"
-            variant="subtle"
-            color="gray"
-            size="sm"
-          >
-            <IconArrowLeft size={16} />
-          </ActionIcon>
-        </Tooltip>
-        <Text size="sm" fw={500} style={{ color: "var(--lnr-text)" }}>
-          VM Terminal
-        </Text>
-        <Text size="xs" style={{ color: "var(--lnr-text-muted)" }}>
-          SSH session · VM {vmId}
-        </Text>
+      <Group gap="sm" align="center" justify="space-between">
+        <Group gap="sm" align="center">
+          <Tooltip label="Back to VMs">
+            <ActionIcon
+              component={Link}
+              href="/ui/vms"
+              variant="subtle"
+              color="gray"
+              size="sm"
+            >
+              <IconArrowLeft size={16} />
+            </ActionIcon>
+          </Tooltip>
+          <Text size="sm" fw={500} style={{ color: "var(--lnr-text)" }}>
+            VM Terminal
+          </Text>
+          <Text size="xs" style={{ color: "var(--lnr-text-muted)" }}>
+            Serial console · VM {vmId}
+          </Text>
+        </Group>
+
+        {credentials && (
+          <Group gap="xs" align="center">
+            <Text size="xs" style={{ color: "var(--lnr-text-muted)" }}>Login:</Text>
+            <Badge variant="outline" color="blue" size="sm">{credentials.username}</Badge>
+            <CopyButton value={credentials.password} timeout={2000}>
+              {({ copied, copy }) => (
+                <Tooltip label={copied ? "Copied!" : "Copy password"}>
+                  <Badge
+                    variant="outline"
+                    color="gray"
+                    size="sm"
+                    style={{ cursor: "pointer", fontFamily: "monospace" }}
+                    onClick={copy}
+                    rightSection={copied ? <IconCheck size={10} /> : <IconCopy size={10} />}
+                  >
+                    {credentials.password}
+                  </Badge>
+                </Tooltip>
+              )}
+            </CopyButton>
+          </Group>
+        )}
       </Group>
 
       <Box

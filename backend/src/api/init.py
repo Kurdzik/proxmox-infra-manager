@@ -3,7 +3,7 @@ from sqlmodel import Session, select
 
 from src.models import ApiResponse, InitConfigureRequest, PlatformConfig
 from src.proxmox import ProxmoxAdapterFactory, ProxmoxCredentials
-from src.crypto import encrypt_str
+from src.crypto import decrypt_str, encrypt_str
 from src.utils import get_db_session, get_user_info, require_admin
 from src.logger import get_logger
 
@@ -23,12 +23,29 @@ def get_init_status(db_session: Session = Depends(get_db_session)):
     )
 
 
+def _resolve_secret(request: InitConfigureRequest, db_session: Session) -> str:
+    """Return the token secret to use: the one from the request, or the stored one if omitted."""
+    if request.token_secret:
+        return request.token_secret
+    config = db_session.exec(select(PlatformConfig)).first()
+    if config and config.encrypted_token_secret:
+        return decrypt_str(config.encrypted_token_secret)
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Token secret is required — no existing secret is stored yet.",
+    )
+
+
 @router.post("/test-connection", response_model=ApiResponse)
-def test_connection(request: InitConfigureRequest):
+def test_connection(
+    request: InitConfigureRequest,
+    db_session: Session = Depends(get_db_session),
+):
+    token_secret = _resolve_secret(request, db_session)
     credentials = ProxmoxCredentials(
         url=request.proxmox_url,
         token_id=request.token_id,
-        token_secret=request.token_secret,
+        token_secret=token_secret,
         verify_ssl=request.verify_ssl,
     )
     try:
@@ -51,10 +68,11 @@ def configure_platform(
     request: InitConfigureRequest,
     db_session: Session = Depends(get_db_session),
 ):
+    token_secret = _resolve_secret(request, db_session)
     credentials = ProxmoxCredentials(
         url=request.proxmox_url,
         token_id=request.token_id,
-        token_secret=request.token_secret,
+        token_secret=token_secret,
         verify_ssl=request.verify_ssl,
     )
 
@@ -67,14 +85,13 @@ def configure_platform(
             detail=f"Cannot reach Proxmox API: {str(e)}",
         )
 
-    encrypted_secret = encrypt_str(request.token_secret)
-
     config = db_session.exec(select(PlatformConfig)).first()
     if config:
         config.proxmox_url = request.proxmox_url
         config.proxmox_version = request.proxmox_version
         config.token_id = request.token_id
-        config.encrypted_token_secret = encrypted_secret
+        if request.token_secret:
+            config.encrypted_token_secret = encrypt_str(request.token_secret)
         config.verify_ssl = request.verify_ssl
         config.is_initialized = True
     else:
@@ -82,7 +99,7 @@ def configure_platform(
             proxmox_url=request.proxmox_url,
             proxmox_version=request.proxmox_version,
             token_id=request.token_id,
-            encrypted_token_secret=encrypted_secret,
+            encrypted_token_secret=encrypt_str(token_secret),
             verify_ssl=request.verify_ssl,
             is_initialized=True,
         )
@@ -91,7 +108,7 @@ def configure_platform(
     db_session.commit()
 
     return ApiResponse(
-        message="Platform initialized successfully",
+        message="Platform configuration saved",
         data={"node_count": len(nodes) if isinstance(nodes, list) else 0},
     )
 

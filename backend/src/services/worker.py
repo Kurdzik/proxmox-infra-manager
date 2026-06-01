@@ -209,6 +209,8 @@ def provision_vm(
     bridge: str,
     network_id: int | None = None,
     user_ssh_key_ids: list = [],
+    auth_type: str = "ssh_key",
+    user_password: str | None = None,
 ):
     from celery.exceptions import Retry
 
@@ -340,7 +342,7 @@ def provision_vm(
                 verify_ssl = config.verify_ssl
 
                 user_public_keys: list[str] = []
-                if user_ssh_key_ids:
+                if user_ssh_key_ids and auth_type == "ssh_key":
                     from src.models import UserSSHKey as UserKey
                     user_keys = db.exec(
                         select(UserKey).where(
@@ -352,6 +354,14 @@ def provision_vm(
 
             img = IMAGE_BY_ID.get(image_id)
             public_key, private_key_pem = generate_ed25519_keypair()
+
+            if auth_type == "password" and user_password:
+                console_password = user_password
+            else:
+                import secrets as _secrets
+                import string as _string
+                _alphabet = _string.ascii_letters + _string.digits
+                console_password = "".join(_secrets.choice(_alphabet) for _ in range(20))
 
             os.makedirs(work_dir, exist_ok=True)
             tf_mgr = TerraformManager(work_dir)
@@ -370,6 +380,7 @@ def provision_vm(
                 "image_filename": img["filename"],
                 "bridge": bridge,
                 "cloud_init_user": cloud_init_user,
+                "console_password": console_password,
                 "ssh_public_keys": [public_key] + user_public_keys,
                 # Static IP fields (None → falls back to DHCP in the template)
                 "static_ip": static_ip,
@@ -407,6 +418,8 @@ def provision_vm(
                     vm.cpu_cores = cpu_cores
                     vm.memory_mb = memory_mb
                     vm.disk_gb = disk_gb
+                    vm.console_password_encrypted = encrypt_str(console_password)
+                    vm.auth_type = auth_type
                     if initial_ip:
                         vm.ip_address = initial_ip
                     vm.updated_at = datetime.now()

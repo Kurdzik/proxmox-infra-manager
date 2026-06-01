@@ -27,7 +27,7 @@ class InitConfigureRequest(BaseModel):
     proxmox_url: str
     proxmox_version: str    # "7.4", "8.2", etc.
     token_id: str
-    token_secret: str
+    token_secret: Optional[str] = None   # omit to keep the existing stored secret
     verify_ssl: bool = False
 
 
@@ -75,6 +75,8 @@ class ProvisionVMRequest(BaseModel):
     bridge: Optional[str] = None      # explicit Proxmox bridge override (rarely needed)
     network_id: Optional[int] = None  # FK to TenantVNet.id; uses default VNet when omitted
     user_ssh_key_ids: list[int] = []
+    auth_type: str = "ssh_key"        # "ssh_key" | "password"
+    user_password: Optional[str] = None  # used when auth_type == "password"
 
 
 # ---------------------------------------------------------------------------

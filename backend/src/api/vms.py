@@ -78,6 +78,34 @@ def list_images(
     return ApiResponse(message="Images retrieved", data={"images": images, "storage": storage})
 
 
+@router.get("/{vm_id}/console-credentials", response_model=ApiResponse)
+def get_vm_console_credentials(
+    vm_id: int,
+    db_session: Session = Depends(get_db_session),
+    user_info: UserInfo = Depends(get_user_info),
+):
+    """Return the console username and password for serial console (termproxy) access."""
+    from src.crypto import decrypt_str
+    with tenant_context(tenant_id=user_info.tenant_id, service_name="api.vms"):
+        vm = db_session.exec(
+            select(VM).where(and_(VM.tenant_id == user_info.tenant_id, VM.id == vm_id))
+        ).first()
+        if not vm:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="VM not found")
+        if not vm.console_password_encrypted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No console credentials — VM was provisioned before this feature was added",
+            )
+        return ApiResponse(
+            message="Console credentials retrieved",
+            data={
+                "username": vm.cloud_init_user or "ubuntu",
+                "password": decrypt_str(vm.console_password_encrypted),
+            },
+        )
+
+
 @router.get("/{vm_id}/ssh-key", response_model=ApiResponse)
 def get_vm_ssh_key(
     vm_id: int,
@@ -184,6 +212,7 @@ def provision_vm(
             disk_gb=request.disk_gb,
             cloud_init_user=request.cloud_init_user,
             network_id=resolved_network_id,
+            auth_type=request.auth_type,
         )
         db_session.add(vm)
         db_session.commit()
@@ -204,6 +233,8 @@ def provision_vm(
                 "bridge": bridge,
                 "network_id": resolved_network_id,
                 "user_ssh_key_ids": request.user_ssh_key_ids,
+                "auth_type": request.auth_type,
+                "user_password": request.user_password,
             },
             ignore_result=True,
         )
@@ -214,31 +245,6 @@ def provision_vm(
 
         return ApiResponse(message="VM provisioning queued", data={"task_id": task.id, "vm_id": vm.id})
 
-
-@router.patch("/{vm_id}/ip", response_model=ApiResponse)
-def set_vm_ip(
-    vm_id: int,
-    body: dict,
-    db_session: Session = Depends(get_db_session),
-    user_info: UserInfo = Depends(get_user_info),
-):
-    """Manually set the IP address for a VM (useful when guest agent is unavailable)."""
-    with tenant_context(tenant_id=user_info.tenant_id, service_name="api.vms"):
-        vm = db_session.exec(
-            select(VM).where(and_(VM.tenant_id == user_info.tenant_id, VM.id == vm_id))
-        ).first()
-        if not vm:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="VM not found")
-
-        ip = (body.get("ip_address") or "").strip()
-        if not ip:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="ip_address is required")
-
-        vm.ip_address = ip
-        db_session.add(vm)
-        db_session.commit()
-        logger.info("vm_ip_manually_set", vm_id=vm_id, ip=ip)
-        return ApiResponse(message="IP address updated", data={"vm_id": vm_id, "ip_address": ip})
 
 
 @router.delete("/{vm_id}", response_model=ApiResponse)

@@ -141,6 +141,8 @@ class VM(SQLModel, table=True):
     template_id: Optional[int] = Field(default=None, foreign_key="vm_templates.id")
     network_id: Optional[int] = Field(default=None, foreign_key="tenant_vnets.id")
     task_id: Optional[str] = None
+    console_password_encrypted: Optional[str] = None  # random password set via cloud-init for serial console access
+    auth_type: str = Field(default="ssh_key")  # "ssh_key" | "password"
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
 
