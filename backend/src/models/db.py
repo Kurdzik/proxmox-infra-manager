@@ -327,6 +327,67 @@ class NginxConfig(SQLModel, table=True):
 
 
 # ---------------------------------------------------------------------------
+# Apps — prebuilt service provisioning
+# ---------------------------------------------------------------------------
+
+class AppCatalogEntry(SQLModel, table=True):
+    __tablename__ = "app_catalog_entries"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str                          # e.g. "PostgreSQL"
+    slug: str = Field(unique=True)     # e.g. "postgres"
+    description: Optional[str] = None
+    default_port: int                  # e.g. 5432
+    port_range_start: int              # nginx stream port pool start, e.g. 54000
+    port_range_end: int                # nginx stream port pool end, e.g. 54999
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class AppVersion(SQLModel, table=True):
+    __tablename__ = "app_versions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    catalog_entry_id: int = Field(foreign_key="app_catalog_entries.id", index=True)
+    version: str                       # e.g. "17", "16", "15"
+    is_latest: bool = Field(default=False)
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class AppPlaybook(SQLModel, table=True):
+    __tablename__ = "app_playbooks"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    catalog_entry_id: int = Field(foreign_key="app_catalog_entries.id", index=True)
+    version_id: Optional[int] = Field(default=None, foreign_key="app_versions.id")  # null = all versions
+    name: str
+    description: Optional[str] = None
+    playbook_content: str              # Jinja2 YAML template
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: datetime = Field(default_factory=datetime.now)
+
+
+class AppInstance(SQLModel, table=True):
+    __tablename__ = "app_instances"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    tenant_id: str = Field(index=True)
+    name: str                          # user-visible label
+    catalog_entry_id: int = Field(foreign_key="app_catalog_entries.id", index=True)
+    version: str                       # stored string, e.g. "17"
+    vm_id: Optional[int] = Field(default=None, foreign_key="vms.id")
+    node_name: str
+    # provisioning → configuring → running | error | stopped
+    status: str = Field(default="provisioning")
+    internal_port: int                 # app port inside the VM
+    external_port: Optional[int] = None  # nginx stream listen port
+    nginx_config_id: Optional[int] = Field(default=None, foreign_key="nginx_configs.id")
+    connection_credentials: Optional[str] = None  # AES-GCM encrypted JSON {db_user, db_password}
+    task_id: Optional[str] = None
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: datetime = Field(default_factory=datetime.now)
+
+
+# ---------------------------------------------------------------------------
 # Logging + tenant settings
 # ---------------------------------------------------------------------------
 

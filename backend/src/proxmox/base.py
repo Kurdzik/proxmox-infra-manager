@@ -80,6 +80,12 @@ class BaseProxmoxAdapter:
         """Execute a command inside a QEMU VM via the QEMU guest agent."""
         self._not_implemented()
 
+    def exec_vm_wait(
+        self, node: str, vmid: int, command: list[str], timeout: int = 600, poll_interval: int = 3
+    ) -> dict:
+        """Execute a command via QEMU guest agent and wait for completion."""
+        self._not_implemented()
+
     def get_vm_ip(self, node: str, vmid: int) -> Optional[str]:
         """Return the first non-loopback IPv4 address reported by the QEMU guest agent, or None."""
         self._not_implemented()

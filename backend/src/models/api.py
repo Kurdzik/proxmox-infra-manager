@@ -166,3 +166,19 @@ class AddAllowedImageRequest(BaseModel):
     tag_policy: str = "any"
     allowed_tags: Optional[list[str]] = None
     description: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Apps
+# ---------------------------------------------------------------------------
+
+class ProvisionAppRequest(BaseModel):
+    catalog_entry_id: int
+    version_id: int
+    app_name: str
+    node_name: str
+    image_id: str
+    cpu_cores: int = 2
+    memory_mb: int = 2048
+    disk_gb: int = 20
+    network_id: Optional[int] = None  # FK to TenantVNet.id; null = auto-create isolated VNet

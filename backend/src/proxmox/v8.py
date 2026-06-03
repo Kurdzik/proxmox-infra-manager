@@ -51,6 +51,49 @@ class ProxmoxVE8Adapter(BaseProxmoxAdapter):
             json={"command": command},
         )
 
+    def exec_vm_wait(
+        self, node: str, vmid: int, command: list[str], timeout: int = 600, poll_interval: int = 3
+    ) -> dict:
+        """Execute a command via QEMU guest agent and wait for it to finish.
+
+        Polls exec-status until exited=True or timeout is reached.
+        Returns the result dict with keys: exitcode, out-data, err-data.
+        Raises RuntimeError on non-zero exit or timeout.
+        """
+        import time as _time
+
+        resp = self._request(
+            "POST",
+            f"/nodes/{node}/qemu/{vmid}/agent/exec",
+            json={"command": command},
+        )
+        pid = resp.get("pid")
+        if not pid:
+            raise RuntimeError(f"exec_vm_wait: no PID in response: {resp}")
+
+        deadline = _time.monotonic() + timeout
+        while True:
+            status = self._request(
+                "GET",
+                f"/nodes/{node}/qemu/{vmid}/agent/exec-status",
+                params={"pid": pid},
+            )
+            if status.get("exited"):
+                exitcode = status.get("exitcode", 0)
+                if exitcode != 0:
+                    out = status.get("out-data", "")
+                    err = status.get("err-data", "")
+                    raise RuntimeError(
+                        f"Command {command[0]!r} exited {exitcode}. "
+                        f"stdout={out[-500:]!r} stderr={err[-500:]!r}"
+                    )
+                return status
+            if _time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"Timed out waiting for command {command[0]!r} after {timeout}s"
+                )
+            _time.sleep(poll_interval)
+
     def get_vm_ip(self, node: str, vmid: int) -> Optional[str]:
         """Return the first non-loopback IPv4 address via QEMU guest agent, or None."""
         interfaces = self._request("GET", f"/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces")

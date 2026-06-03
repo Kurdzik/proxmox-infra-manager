@@ -19,6 +19,19 @@ provider "proxmox" {
   }
 }
 
+{% if install_guest_agent %}
+resource "proxmox_virtual_environment_file" "cloud_init_agent" {
+  content_type = "snippets"
+  datastore_id = "local"
+  node_name    = "{{ node_name }}"
+
+  source_raw {
+    data      = "#cloud-config\npackages:\n  - qemu-guest-agent\nruncmd:\n  - systemctl enable qemu-guest-agent\n  - systemctl start qemu-guest-agent\n"
+    file_name = "cloud-init-agent-{{ vmid }}.yaml"
+  }
+}
+
+{% endif %}
 resource "proxmox_virtual_environment_vm" "vm" {
   name      = "{{ vm_name }}"
   node_name = "{{ node_name }}"
@@ -60,6 +73,11 @@ resource "proxmox_virtual_environment_vm" "vm" {
     model  = "virtio"
   }
 
+{% if install_guest_agent %}
+  # Upload a cloud-init snippet that installs qemu-guest-agent on first boot
+  # so the Proxmox exec API can be used to configure the VM after provisioning.
+{% endif %}
+
   initialization {
     datastore_id = "local"
 
@@ -78,10 +96,13 @@ resource "proxmox_virtual_environment_vm" "vm" {
       password = "{{ console_password }}"
       keys     = [{% for key in ssh_public_keys %}"{{ key }}"{% if not loop.last %}, {% endif %}{% endfor %}]
     }
+{% if install_guest_agent %}
+    user_data_file_id = proxmox_virtual_environment_file.cloud_init_agent.id
+{% endif %}
   }
 
   agent {
-    enabled = false
+    enabled = {{ "true" if install_guest_agent else "false" }}
   }
 }
 

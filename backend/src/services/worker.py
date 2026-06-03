@@ -7,14 +7,19 @@ from datetime import datetime
 from typing import Optional
 
 from celery import Celery
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, func, text
 from sqlmodel import Session, and_, select
 
 from src import configure_logger, get_logger, tenant_context
 from src.crypto import decrypt_str, encrypt_str
+from src.images import IMAGE_BY_ID
 from src.models import (
     VM,
     AllowedImage,
+    AppCatalogEntry,
+    AppInstance,
+    AppPlaybook,
+    AppVersion,
     DNSEntry,
     DockerService,
     FirewallRule,
@@ -32,7 +37,6 @@ from src.plugin_manager import DockerComposeRunner, IntegrationClient, PluginMan
 from src.proxmox import ProxmoxAdapterFactory, ProxmoxCredentials
 from src.services.ssh_service import generate_ed25519_keypair
 from src.services.tenant_network import (
-    TenantNetworkError,
     allocate_static_ip,
     create_named_vnet,
     ensure_tenant_vnet,
@@ -91,6 +95,31 @@ def _get_adapter(db_session: Session):
     return ProxmoxAdapterFactory.create(config.proxmox_version, credentials)
 
 
+def _ensure_image_on_node(adapter, node_name: str, img: dict, storage: str = "local") -> None:
+    """Download a cloud image to the given Proxmox node/storage if it is not already present.
+
+    Uses the Proxmox download-url API so the transfer happens on the node itself.
+    Blocks until the download task completes (up to 10 minutes).
+    """
+    filename = img["filename"]
+    try:
+        content = adapter.list_storage_content(node_name, storage, "iso")
+        existing = {item.get("volid", "").split("/")[-1] for item in content}
+        if filename in existing:
+            return  # already present, nothing to do
+    except Exception as check_err:
+        logger.warning("image_presence_check_failed", node=node_name, filename=filename, error=str(check_err))
+        # Continue — attempt download anyway; Proxmox will no-op if it already exists.
+
+    logger.info("image_download_started", node=node_name, filename=filename, url=img["url"], persist_db=True)
+    try:
+        upid = adapter.download_iso(node_name, storage, img["url"], filename)
+        adapter.wait_for_task(node_name, upid, poll_interval=10, timeout=600)
+        logger.info("image_download_complete", node=node_name, filename=filename, persist_db=True)
+    except Exception as dl_err:
+        raise RuntimeError(
+            f"Failed to download image '{filename}' to node '{node_name}': {dl_err}"
+        ) from dl_err
 
 
 # ---------------------------------------------------------------------------
@@ -153,22 +182,32 @@ def sync_cluster_state(self):
                     if vm:
                         # Don't overwrite managed transition states — the provision
                         # task owns "provisioning" until it completes or times out.
-                        if vm.status != "provisioning":
-                            vm.status = vm_data.get("status", "stopped")
-                            vm.updated_at = datetime.now()
-                        else:
+                        proxmox_status = vm_data.get("status", "stopped")
+                        age_minutes = (datetime.now() - vm.created_at).total_seconds() / 60
+                        if vm.status == "provisioning":
                             # Rescue VMs stuck in provisioning (worker crash, agent timeout, etc).
                             # Use created_at (immutable) — updated_at is refreshed by this loop
                             # and would never exceed the threshold.
                             # Threshold: 15 min to allow for Terraform + Phase 2 polling (10 min).
-                            age_minutes = (datetime.now() - vm.created_at).total_seconds() / 60
-                            if age_minutes > 15 and vm_data.get("status") == "running":
+                            if age_minutes > 15 and proxmox_status == "running":
                                 vm.status = "running"
                                 vm.updated_at = datetime.now()
                                 logger.warning(
                                     "vm_rescued_from_stuck_provisioning",
                                     vmid=vmid, age_minutes=round(age_minutes),
                                 )
+                        elif vm.status == "error" and proxmox_status == "running" and age_minutes < 30:
+                            # Phase 2 readiness poll may have timed out before the VM finished
+                            # booting. If Proxmox now shows it running, flip it back to running.
+                            vm.status = "running"
+                            vm.updated_at = datetime.now()
+                            logger.warning(
+                                "vm_rescued_from_error_now_running",
+                                vmid=vmid, age_minutes=round(age_minutes),
+                            )
+                        else:
+                            vm.status = proxmox_status
+                            vm.updated_at = datetime.now()
                         if vm_data.get("cpus"):
                             vm.cpu_cores = vm_data["cpus"]
                         if vm_data.get("maxmem"):
@@ -217,10 +256,9 @@ def provision_vm(
     user_ssh_key_ids: list = [],
     auth_type: str = "ssh_key",
     user_password: str | None = None,
+    install_guest_agent: bool = False,
 ):
     from celery.exceptions import Retry
-
-    from src.images import IMAGE_BY_ID
 
     with tenant_context(tenant_id=tenant_id, service_name="worker.provision_vm"):
         work_dir = f"/tmp/tf_{vm_id}"
@@ -391,6 +429,15 @@ def provision_vm(
             # ← DB session closed; all values captured in locals
 
             img = IMAGE_BY_ID.get(image_id)
+
+            # Ensure the cloud image is present on the target node before running Terraform.
+            # download_iso() is a no-op if the image is already cached; if absent it triggers
+            # a Proxmox-side download and we wait for it to finish (up to 10 min).
+            if img:
+                with Session(engine) as img_db:
+                    img_adapter = _get_adapter(img_db)
+                _ensure_image_on_node(img_adapter, node_name, img)
+
             public_key, private_key_pem = generate_ed25519_keypair()
 
             if auth_type == "password" and user_password:
@@ -424,6 +471,7 @@ def provision_vm(
                 "static_ip": static_ip,
                 "gateway": static_gateway,
                 "prefix_len": static_prefix_len,
+                "install_guest_agent": install_guest_agent,
             })
             tf_mgr.write_config(rendered)
 
@@ -667,7 +715,7 @@ def destroy_vm(self, vm_id: int, tenant_id: str):
                                 if attempt < 5:
                                     time.sleep(3)
 
-                # Delete SSH key record
+                # Delete SSH key record before VM to satisfy FK constraint
                 ssh_key = db.exec(
                     select(VMSSHKey).where(
                         and_(VMSSHKey.tenant_id == tenant_id, VMSSHKey.vm_id == vm_id)
@@ -675,8 +723,34 @@ def destroy_vm(self, vm_id: int, tenant_id: str):
                 ).first()
                 if ssh_key:
                     db.delete(ssh_key)
+                    db.flush()
 
+                vm_network_id = vm.network_id
                 db.delete(vm)
+
+                # If the VM had a dedicated VNet and was its last resident, clean up the VNet.
+                if vm_network_id:
+                    remaining = db.exec(
+                        select(func.count(VM.id)).where(
+                            and_(VM.tenant_id == tenant_id, VM.network_id == vm_network_id)
+                        )
+                    ).one()
+                    if remaining == 0:
+                        orphan_vnet = db.exec(
+                            select(TenantVNet).where(TenantVNet.id == vm_network_id)
+                        ).first()
+                        if orphan_vnet:
+                            try:
+                                vnet_adapter = _get_adapter(db)
+                                vnet_adapter.delete_vnet(orphan_vnet.vnet_id)
+                            except Exception as ve:
+                                logger.warning(
+                                    "orphan_vnet_proxmox_delete_failed",
+                                    vnet_id=orphan_vnet.vnet_id, error=str(ve),
+                                )
+                            db.delete(orphan_vnet)
+                            logger.info("orphan_vnet_deleted", vnet_id=orphan_vnet.vnet_id, persist_db=True)
+
                 db.commit()
                 logger.info("vm_destroyed_terraform", vmid=vm.vmid, persist_db=True)
 
@@ -1142,3 +1216,423 @@ def cleanup_old_logs(self, tenant_id: str, log_retention_period_d: int, log_size
                 )
             )
             db.commit()
+
+
+# ---------------------------------------------------------------------------
+# App provisioning (VM + Ansible)
+# ---------------------------------------------------------------------------
+
+@app.task(bind=True, max_retries=TASK_MAX_RETRIES, soft_time_limit=3540, time_limit=3600)
+def provision_app_task(
+    self,
+    app_instance_id: int,
+    tenant_id: str,
+    catalog_entry_id: int,
+    version_id: int,
+    app_name: str,
+    node_name: str,
+    image_id: str,
+    cpu_cores: int,
+    memory_mb: int,
+    disk_gb: int,
+    network_id: int | None = None,
+):
+    import secrets as _secrets
+
+    with tenant_context(tenant_id=tenant_id, service_name="worker.provision_app"):
+        # ── Phase 0: Look up catalog + playbook, create the VM record ────────
+        try:
+            with Session(engine) as db:
+                app_inst = db.exec(
+                    select(AppInstance).where(AppInstance.id == app_instance_id)
+                ).first()
+                if not app_inst:
+                    raise ValueError(f"AppInstance {app_instance_id} not found")
+
+                catalog = db.exec(
+                    select(AppCatalogEntry).where(AppCatalogEntry.id == catalog_entry_id)
+                ).first()
+                if not catalog:
+                    raise ValueError(f"AppCatalogEntry {catalog_entry_id} not found")
+
+                version_obj = db.exec(
+                    select(AppVersion).where(AppVersion.id == version_id)
+                ).first()
+                if not version_obj:
+                    raise ValueError(f"AppVersion {version_id} not found")
+
+                # Find playbook: version-specific first, then generic
+                playbook = db.exec(
+                    select(AppPlaybook).where(
+                        and_(
+                            AppPlaybook.catalog_entry_id == catalog_entry_id,
+                            AppPlaybook.version_id == version_id,
+                        )
+                    )
+                ).first()
+                if not playbook:
+                    playbook = db.exec(
+                        select(AppPlaybook).where(
+                            and_(
+                                AppPlaybook.catalog_entry_id == catalog_entry_id,
+                                AppPlaybook.version_id == None,  # noqa: E711
+                            )
+                        )
+                    ).first()
+                if not playbook:
+                    raise ValueError(f"No playbook for {catalog.name} {version_obj.version}")
+
+                compose_template = playbook.playbook_content
+                app_version_str = version_obj.version
+                internal_port = catalog.default_port
+                port_range_start = catalog.port_range_start
+                port_range_end = catalog.port_range_end
+                catalog_slug = catalog.slug
+
+                # Create a VM record owned by this app
+                from src.models.db import VM as VMModel
+                vm_record = VMModel(
+                    tenant_id=tenant_id,
+                    vmid=0,  # placeholder until Phase 0 of provision_vm assigns a real vmid
+                    node_name=node_name,
+                    name=app_name,
+                    status="provisioning",
+                    cpu_cores=cpu_cores,
+                    memory_mb=memory_mb,
+                    disk_gb=disk_gb,
+                    network_id=network_id,
+                )
+                db.add(vm_record)
+                db.commit()
+                db.refresh(vm_record)
+                vm_id = vm_record.id
+
+                app_inst.vm_id = vm_id
+                app_inst.internal_port = internal_port
+                db.add(app_inst)
+                db.commit()
+
+        except Exception as e:
+            with Session(engine) as db:
+                inst = db.exec(select(AppInstance).where(AppInstance.id == app_instance_id)).first()
+                if inst:
+                    inst.status = "error"
+                    inst.updated_at = datetime.now()
+                    db.add(inst)
+                    db.commit()
+            logger.error(
+                "app_provision_setup_failed", app_id=app_instance_id,
+                error=str(e), exc_info=True, persist_db=True,
+            )
+            raise
+
+        # ── Phase 1: Provision the VM via existing pipeline ──────────────────
+        try:
+            provision_vm(
+                vm_id=vm_id,
+                node_name=node_name,
+                vm_name=app_name,
+                tenant_id=tenant_id,
+                image_id=image_id,
+                cpu_cores=cpu_cores,
+                memory_mb=memory_mb,
+                disk_gb=disk_gb,
+                cloud_init_user="ubuntu",
+                network_id=network_id,
+                install_guest_agent=True,
+            )
+        except Exception as e:
+            with Session(engine) as db:
+                inst = db.exec(select(AppInstance).where(AppInstance.id == app_instance_id)).first()
+                if inst:
+                    inst.status = "error"
+                    inst.updated_at = datetime.now()
+                    db.add(inst)
+                    db.commit()
+            logger.error(
+                "app_vm_provision_failed", app_id=app_instance_id,
+                error=str(e), exc_info=True, persist_db=True,
+            )
+            raise
+
+        # ── Phase 2: Wait for VM to be running, then set status=configuring ──
+        vm_ip: str | None = None
+        for _ in range(60):
+            time.sleep(5)
+            with Session(engine) as db:
+                vm_rec = db.exec(select(VM).where(VM.id == vm_id)).first()
+                if vm_rec and vm_rec.status == "running":
+                    vm_ip = vm_rec.ip_address
+                    break
+                if vm_rec and vm_rec.status == "error":
+                    break
+
+        if not vm_ip:
+            with Session(engine) as db:
+                inst = db.exec(select(AppInstance).where(AppInstance.id == app_instance_id)).first()
+                if inst:
+                    inst.status = "error"
+                    inst.updated_at = datetime.now()
+                    db.add(inst)
+                    db.commit()
+            logger.error("app_vm_never_ready", app_id=app_instance_id, vm_id=vm_id, persist_db=True)
+            return
+
+        with Session(engine) as db:
+            inst = db.exec(select(AppInstance).where(AppInstance.id == app_instance_id)).first()
+            if inst:
+                inst.status = "configuring"
+                inst.updated_at = datetime.now()
+                db.add(inst)
+                db.commit()
+
+        # ── Phase 3: Install Docker + deploy docker-compose on VM ───────────
+        db_password = _secrets.token_urlsafe(16)
+        db_user = "appuser"
+
+        try:
+            import base64
+            from jinja2 import Environment as _JinjaEnv
+
+            with Session(engine) as db:
+                vm_rec = db.exec(select(VM).where(VM.id == vm_id)).first()
+                node_name_for_exec = vm_rec.node_name
+                vmid_for_exec = vm_rec.vmid
+                adapter = _get_adapter(db)
+
+            # Render the docker-compose template stored in AppPlaybook
+            compose_content = _JinjaEnv().from_string(compose_template).render(
+                version=app_version_str,
+                app_port=internal_port,
+                db_user=db_user,
+                db_password=db_password,
+            )
+            compose_b64 = base64.b64encode(compose_content.encode()).decode()
+
+            logger.info(
+                "app_configure_started", app_id=app_instance_id, vm_ip=vm_ip, persist_db=True
+            )
+
+            def _exec(cmd: list[str], timeout: int = 600) -> None:
+                adapter.exec_vm_wait(node_name_for_exec, vmid_for_exec, cmd, timeout=timeout)
+
+            # Wait for QEMU guest agent to be ready (VM may be running but agent still booting)
+            agent_ready = False
+            for _attempt in range(40):  # up to ~2 min
+                try:
+                    adapter.exec_vm(node_name_for_exec, vmid_for_exec, ["true"])
+                    agent_ready = True
+                    break
+                except Exception:
+                    time.sleep(3)
+            if not agent_ready:
+                raise RuntimeError("QEMU guest agent did not become ready within 2 minutes")
+
+            # 1. Install Docker using the official per-distro script
+            from pathlib import Path as _Path
+            from src.images import IMAGE_BY_ID as _IMAGE_BY_ID
+            _SCRIPTS_DIR = _Path(__file__).parent.parent / "scripts"
+            _os_family = _IMAGE_BY_ID.get(image_id, {}).get("os_family", "ubuntu")
+            _script_map = {
+                "ubuntu": "install_docker_debian.sh",
+                "debian": "install_docker_debian.sh",
+                "rhel":   "install_docker_rhel.sh",
+            }
+            _script_name = _script_map.get(_os_family, "install_docker_debian.sh")
+            _script_content = (_SCRIPTS_DIR / _script_name).read_text()
+            _script_b64 = base64.b64encode(_script_content.encode()).decode()
+            _exec(["bash", "-c", f"echo '{_script_b64}' | base64 -d > /tmp/install_docker.sh"])
+            _exec(["bash", "/tmp/install_docker.sh"], timeout=300)
+
+            # 2. Write docker-compose.yml (base64-encoded to avoid quoting issues)
+            _exec(["mkdir", "-p", "/opt/app"])
+            _exec([
+                "bash", "-c",
+                f"echo '{compose_b64}' | base64 -d > /opt/app/docker-compose.yml",
+            ])
+
+            # 3. Pull images and start services
+            _exec(
+                ["bash", "-c", "cd /opt/app && docker compose pull"],
+                timeout=300,
+            )
+            _exec(
+                ["bash", "-c", "cd /opt/app && docker compose up -d"],
+                timeout=120,
+            )
+
+            logger.info("app_configure_complete", app_id=app_instance_id, persist_db=True)
+
+        except Exception as e:
+            with Session(engine) as db:
+                inst = db.exec(select(AppInstance).where(AppInstance.id == app_instance_id)).first()
+                if inst:
+                    inst.status = "error"
+                    inst.updated_at = datetime.now()
+                    db.add(inst)
+                    db.commit()
+            logger.error(
+                "app_configure_failed", app_id=app_instance_id,
+                error=str(e), exc_info=True, persist_db=True,
+            )
+            raise
+
+        # ── Phase 4: Assign nginx stream port + write config ─────────────────
+        try:
+            with Session(engine) as db:
+                nginx_mgr = NginxConfigManager()
+                external_port = nginx_mgr.allocate_stream_port(db, port_range_start, port_range_end)
+
+                service_name = f"app_{app_instance_id}_{catalog_slug}"
+                rendered = nginx_mgr.render_stream(
+                    service_name=service_name,
+                    listen_port=external_port,
+                    upstream_ip=vm_ip,
+                    upstream_port=internal_port,
+                )
+                config_filename = f"app-{app_instance_id}-{catalog_slug}.conf"
+                nginx_cfg = NginxConfig(
+                    tenant_id=tenant_id,
+                    service_name=service_name,
+                    proxy_type="stream",
+                    server_name=service_name,
+                    upstream_ip=vm_ip,
+                    upstream_port=internal_port,
+                    listen_port=external_port,
+                    config_filename=config_filename,
+                    rendered_config=rendered,
+                )
+                db.add(nginx_cfg)
+                db.flush()
+
+                nginx_mgr.write_config(nginx_cfg)
+                nginx_mgr.reload_nginx()
+
+                import json as _json
+
+                from src.crypto import encrypt_str as _encrypt_str
+                cred_payload = _json.dumps({"db_user": db_user, "db_password": db_password})
+                encrypted_creds = _encrypt_str(cred_payload)
+
+                inst = db.exec(select(AppInstance).where(AppInstance.id == app_instance_id)).first()
+                if inst:
+                    inst.status = "running"
+                    inst.external_port = external_port
+                    inst.nginx_config_id = nginx_cfg.id
+                    inst.connection_credentials = encrypted_creds
+                    inst.updated_at = datetime.now()
+                    db.add(inst)
+                db.commit()
+                logger.info(
+                    "app_provisioned",
+                    app_id=app_instance_id,
+                    catalog=catalog_slug,
+                    version=app_version_str,
+                    external_port=external_port,
+                    persist_db=True,
+                )
+
+        except Exception as e:
+            with Session(engine) as db:
+                inst = db.exec(select(AppInstance).where(AppInstance.id == app_instance_id)).first()
+                if inst:
+                    inst.status = "error"
+                    inst.updated_at = datetime.now()
+                    db.add(inst)
+                    db.commit()
+            logger.error(
+                "app_nginx_setup_failed", app_id=app_instance_id,
+                error=str(e), exc_info=True, persist_db=True,
+            )
+            raise
+
+
+@app.task(bind=True, soft_time_limit=660, time_limit=720)
+def destroy_app_task(self, app_instance_id: int, tenant_id: str):
+    with tenant_context(tenant_id=tenant_id, service_name="worker.destroy_app"):
+        with Session(engine) as db:
+            inst = db.exec(
+                select(AppInstance).where(
+                    and_(AppInstance.tenant_id == tenant_id, AppInstance.id == app_instance_id)
+                )
+            ).first()
+            if not inst:
+                return
+
+            # Remove nginx stream config
+            if inst.nginx_config_id:
+                nginx_cfg = db.exec(
+                    select(NginxConfig).where(NginxConfig.id == inst.nginx_config_id)
+                ).first()
+                if nginx_cfg:
+                    try:
+                        NginxConfigManager().delete_config(nginx_cfg)
+                        NginxConfigManager().reload_nginx()
+                    except Exception as e:
+                        logger.warning(
+                            "app_nginx_remove_failed", app_id=app_instance_id, error=str(e)
+                        )
+                    db.delete(nginx_cfg)
+
+            vm_id = inst.vm_id
+            db.delete(inst)
+            db.commit()
+
+            # Destroy the underlying VM
+            if vm_id:
+                try:
+                    destroy_vm(vm_id=vm_id, tenant_id=tenant_id)
+                except Exception as e:
+                    logger.warning(
+                        "app_vm_destroy_failed", app_id=app_instance_id, vm_id=vm_id, error=str(e)
+                    )
+
+            logger.info("app_destroyed", app_id=app_instance_id, persist_db=True)
+
+
+@app.task(bind=True, soft_time_limit=120, time_limit=180)
+def control_app_service_task(self, app_instance_id: int, tenant_id: str, action: str):
+    with tenant_context(tenant_id=tenant_id, service_name="worker.control_app"):
+        with Session(engine) as db:
+            inst = db.exec(
+                select(AppInstance).where(
+                    and_(AppInstance.tenant_id == tenant_id, AppInstance.id == app_instance_id)
+                )
+            ).first()
+            if not inst:
+                return
+
+            catalog = db.exec(
+                select(AppCatalogEntry).where(AppCatalogEntry.id == inst.catalog_entry_id)
+            ).first()
+            if not catalog:
+                return
+
+            vm = db.exec(select(VM).where(VM.id == inst.vm_id)).first() if inst.vm_id else None
+            if not vm:
+                raise ValueError(f"VM not found for app instance {app_instance_id}")
+
+            adapter = _get_adapter(db)
+
+            try:
+                adapter.exec_vm(
+                    vm.node_name,
+                    vm.vmid,
+                    ["systemctl", action, catalog.slug],
+                )
+                inst.status = "running" if action == "start" else "stopped"
+                inst.updated_at = datetime.now()
+                db.add(inst)
+                db.commit()
+                logger.info(
+                    "app_service_controlled", app_id=app_instance_id, action=action, persist_db=True
+                )
+            except Exception as e:
+                logger.error(
+                    "app_service_control_failed",
+                    app_id=app_instance_id,
+                    action=action,
+                    error=str(e),
+                    persist_db=True,
+                )
+                raise

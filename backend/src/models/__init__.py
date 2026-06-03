@@ -18,6 +18,10 @@ from src.models.db import (
     NginxConfig,
     Logs,
     TenantLogSettings,
+    AppCatalogEntry,
+    AppVersion,
+    AppPlaybook,
+    AppInstance,
 )
 from src.models.api import (
     ApiResponse,
@@ -36,6 +40,7 @@ from src.models.api import (
     AddDNSEntryRequest,
     InstallPluginRequest,
     AddAllowedImageRequest,
+    ProvisionAppRequest,
 )
 
 __all__ = [
@@ -50,4 +55,6 @@ __all__ = [
     "VNetResponse", "CreateVNetRequest",
     "DeployDockerServiceRequest", "AddFirewallRuleRequest",
     "AddDNSEntryRequest", "InstallPluginRequest", "AddAllowedImageRequest",
+    "AppCatalogEntry", "AppVersion", "AppPlaybook", "AppInstance",
+    "ProvisionAppRequest",
 ]

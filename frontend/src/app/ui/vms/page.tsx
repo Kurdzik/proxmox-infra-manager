@@ -21,15 +21,10 @@ import {
   TextInput,
   Title,
   Tooltip,
-  UnstyledButton,
   rem,
 } from "@mantine/core";
 import {
-  IconCheck,
-  IconCircleCheck,
-  IconCloud,
   IconDeviceDesktop,
-  IconDownload,
   IconPlus,
   IconTerminal,
   IconTrash,
@@ -381,88 +376,46 @@ export default function VMsPage() {
           />
 
           {/* Image picker — cloud-images only */}
-          <Box>
-            <Text size="sm" fw={500} mb="xs" style={{ color: "var(--lnr-text)" }}>
-              Choose cloud image
-            </Text>
-            {imagesLoading ? (
-              <Skeleton height={80} radius="sm" />
-            ) : (
-              <Stack gap="xs">
-                {images.map((img) => {
-                  const selected = selectedImage?.id === img.id;
-                  return (
-                    <UnstyledButton
-                      key={img.id}
-                      onClick={() => {
-                        setSelectedImage(img);
-                        const defaultUser =
-                          img.os_family === "ubuntu" ? "ubuntu"
-                          : img.os_family === "debian" ? "debian"
-                          : img.os_family === "rhel" ? "cloud-user"
-                          : img.os_family === "alpine" ? "alpine"
-                          : "ubuntu";
-                        setCloudInitUser(defaultUser);
-                      }}
-                      style={{
-                        border: `1px solid ${selected ? "var(--mantine-color-blue-6)" : "var(--lnr-border)"}`,
-                        borderRadius: 6,
-                        padding: rem(12),
-                        backgroundColor: selected ? "var(--mantine-color-blue-0)" : "var(--lnr-surface)",
-                        transition: "border-color 120ms, background-color 120ms",
-                      }}
-                    >
-                      <Group justify="space-between" wrap="nowrap">
-                        <Group gap="md" wrap="nowrap">
-                          <OsIcon family={img.os_family} size={36} />
-                          <Box>
-                            <Group gap="xs" align="center">
-                              <Text size="sm" fw={600}>{img.name}</Text>
-                              <Tooltip label="Cloud image — boots with DHCP, SSH key injected via cloud-init">
-                                <Badge size="xs" color="blue" variant="light" leftSection={<IconCloud size={10} />}>
-                                  Cloud
-                                </Badge>
-                              </Tooltip>
-                              {selectedNode && (
-                                img.available ? (
-                                  <Tooltip label="Image already on host">
-                                    <Badge
-                                      size="xs"
-                                      color="green"
-                                      variant="light"
-                                      leftSection={<IconCircleCheck size={10} />}
-                                    >
-                                      Ready
-                                    </Badge>
-                                  </Tooltip>
-                                ) : (
-                                  <Tooltip label={`~${img.size_gb} GB download required`}>
-                                    <Badge
-                                      size="xs"
-                                      color="orange"
-                                      variant="light"
-                                      leftSection={<IconDownload size={10} />}
-                                    >
-                                      {img.size_gb} GB
-                                    </Badge>
-                                  </Tooltip>
-                                )
-                              )}
-                            </Group>
-                            <Text size="xs" c="dimmed">{img.description}</Text>
-                          </Box>
-                        </Group>
-                        {selected && <IconCheck size={16} color="var(--mantine-color-blue-6)" />}
-                      </Group>
-                    </UnstyledButton>
-                  );
-                })}
-                {images.length === 0 && (
-                  <Text size="sm" c="dimmed">No cloud images available.</Text>
-                )}
-              </Stack>
-            )}
-          </Box>
+          <Select
+            label="Choose cloud image"
+            placeholder={imagesLoading ? "Loading images…" : "Select a cloud image"}
+            disabled={imagesLoading}
+            data={images.map((img) => ({ value: img.id, label: img.name }))}
+            value={selectedImage?.id ?? null}
+            onChange={(val) => {
+              const img = images.find((i) => i.id === val) ?? null;
+              setSelectedImage(img);
+              if (img) {
+                const defaultUser =
+                  img.os_family === "ubuntu" ? "ubuntu"
+                  : img.os_family === "debian" ? "debian"
+                  : img.os_family === "rhel" ? "cloud-user"
+                  : img.os_family === "alpine" ? "alpine"
+                  : "ubuntu";
+                setCloudInitUser(defaultUser);
+              }
+            }}
+            renderOption={({ option }) => {
+              const img = images.find((i) => i.id === option.value);
+              if (!img) return <Text size="sm">{option.label}</Text>;
+              return (
+                <Group gap="sm" wrap="nowrap" py={4}>
+                  <OsIcon family={img.os_family} size={28} />
+                  <Box>
+                    <Group gap="xs" align="center">
+                      <Text size="sm" fw={500}>{img.name}</Text>
+                      {selectedNode && (
+                        img.available
+                          ? <Badge size="xs" color="green" variant="light">Ready</Badge>
+                          : <Badge size="xs" color="orange" variant="light">{img.size_gb} GB</Badge>
+                      )}
+                    </Group>
+                    <Text size="xs" c="dimmed">{img.description}</Text>
+                  </Box>
+                </Group>
+              );
+            }}
+          />
 
           <TextInput
             label="VM Name"

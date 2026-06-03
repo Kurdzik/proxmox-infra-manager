@@ -13,6 +13,7 @@ from src.api.dns import router as dns_router
 from src.api.services import router as services_router
 from src.api.keys import router as keys_router
 from src.api.networks import router as networks_router
+from src.api.apps import router as apps_router
 from src.middleware import check_token
 
 # Public router — check_token still runs so request.state is always populated,
@@ -33,6 +34,7 @@ api_router.include_router(dns_router)
 api_router.include_router(services_router)
 api_router.include_router(keys_router)
 api_router.include_router(networks_router)
+api_router.include_router(apps_router)
 
 # WebSocket router — NO check_token dependency: APIKeyHeader requires HTTP Request scope,
 # which WebSocket connections do not provide. The terminal endpoint does its own token auth.

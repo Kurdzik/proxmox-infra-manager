@@ -182,3 +182,49 @@ export interface UserSSHKey {
   has_private_key: boolean;
   created_at: string;
 }
+
+// ── Apps ──────────────────────────────────────────────────────────────────────
+
+export interface AppVersion {
+  id: number;
+  catalog_entry_id: number;
+  version: string;
+  is_latest: boolean;
+}
+
+export interface AppCatalogEntry {
+  id: number;
+  name: string;
+  slug: string;
+  description?: string;
+  default_port: number;
+  port_range_start: number;
+  port_range_end: number;
+  versions: AppVersion[];
+}
+
+export interface AppInstance {
+  id: number;
+  tenant_id: string;
+  name: string;
+  catalog_entry_id: number;
+  catalog_name?: string;
+  catalog_slug?: string;
+  version: string;
+  vm_id?: number;
+  node_name: string;
+  status: "provisioning" | "configuring" | "running" | "error" | "stopped";
+  internal_port: number;
+  external_port?: number;
+  nginx_config_id?: number;
+  task_id?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AppInstanceDetail extends AppInstance {
+  connection_host?: string;
+  connection_port?: number;
+  connection_user?: string;
+  connection_password?: string;
+}

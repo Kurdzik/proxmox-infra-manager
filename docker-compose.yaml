@@ -84,6 +84,7 @@ services:
       context: ./backend
       dockerfile: ../dockerfiles/Dockerfile.backend
     command: ["sh", "-c", "uv run celery -A src.services.worker worker --loglevel=info"]
+    user: "0"
     environment:
       <<: *common-env
     volumes:

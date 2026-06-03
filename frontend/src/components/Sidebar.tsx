@@ -16,6 +16,7 @@ import {
   IconChevronRight,
   IconServerBolt,
   IconSettings,
+  IconPackage,
 } from "@tabler/icons-react";
 import React from "react";
 import Link from "next/link";
@@ -41,6 +42,10 @@ const servicesItems: NavItem[] = [
   { icon: <IconServerBolt size={16} stroke={1.5} />, label: "Service Registry", route: "/ui/services" },
   { icon: <IconNetwork size={16} stroke={1.5} />, label: "DNS", route: "/ui/dns" },
   { icon: <IconShield size={16} stroke={1.5} />, label: "Firewall", route: "/ui/firewall" },
+];
+
+const appsItems: NavItem[] = [
+  { icon: <IconPackage size={16} stroke={1.5} />, label: "Apps", route: "/ui/apps" },
 ];
 
 const platformItems: NavItem[] = [
@@ -111,6 +116,7 @@ export const SidebarComponent = () => {
   const groups = [
     { label: "Infrastructure", items: infrastructureItems },
     { label: "Services", items: servicesItems },
+    { label: "Apps", items: appsItems },
     { label: "Platform", items: platformItems },
   ];
 

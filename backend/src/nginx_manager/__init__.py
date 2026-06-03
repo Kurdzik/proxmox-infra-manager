@@ -1,8 +1,8 @@
 import os
-import subprocess
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
+from sqlmodel import Session, select
 
 from src.models import NginxConfig
 
@@ -53,11 +53,31 @@ class NginxConfigManager:
         if os.path.exists(path):
             os.remove(path)
 
-    def reload_nginx(self) -> None:
-        result = subprocess.run(
-            ["docker", "exec", self.NGINX_CONTAINER_NAME, "nginx", "-s", "reload"],
-            capture_output=True,
-            text=True,
+    def allocate_stream_port(self, db: Session, range_start: int, range_end: int) -> int:
+        """Find the lowest unused TCP port in [range_start, range_end] across all stream configs."""
+        used_ports = set(
+            db.exec(
+                select(NginxConfig.listen_port).where(
+                    NginxConfig.proxy_type == "stream",
+                    NginxConfig.listen_port >= range_start,
+                    NginxConfig.listen_port <= range_end,
+                )
+            ).all()
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"nginx reload failed: {result.stderr}")
+        for port in range(range_start, range_end + 1):
+            if port not in used_ports:
+                return port
+        raise RuntimeError(f"No free ports available in range {range_start}–{range_end}")
+
+    def reload_nginx(self) -> None:
+        import docker
+        client = docker.from_env()
+        try:
+            container = client.containers.get(self.NGINX_CONTAINER_NAME)
+            container.kill(signal="HUP")
+        except docker.errors.NotFound:
+            raise RuntimeError(f"nginx container '{self.NGINX_CONTAINER_NAME}' not found")
+        except docker.errors.APIError as e:
+            raise RuntimeError(f"nginx reload failed: {e}")
+        finally:
+            client.close()
